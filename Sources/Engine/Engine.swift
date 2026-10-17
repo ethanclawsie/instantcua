@@ -333,7 +333,7 @@ public final class Engine {
         e.setBuffer(vx, offset: 0, index: 3)
         e.setBuffer(vxn, offset: 0, index: 4)
         e.setBuffer(vPosInterp, offset: 0, index: 5)
-        grid(e, Dims.vitHidden / 32, npTiles, 128)
+        grid(e, Dims.vitHidden / 128, npTiles, 128)
 
         // 24 Vision Transformer blocks
         for l in 0..<Dims.vitLayers {
@@ -377,7 +377,7 @@ public final class Engine {
             e.setBuffer(vx, offset: 0, index: 3)
             e.setBuffer(vxn, offset: 0, index: 4)
             e.setBuffer(vPosInterp, offset: 0, index: 5)
-            grid(e, Dims.vitHidden / 32, npTiles, 128)
+            grid(e, Dims.vitHidden / 128, npTiles, 128)
 
             // norm2 -> fp16 vxn
             e.setComputePipelineState(pVitLN1024)
@@ -396,7 +396,7 @@ public final class Engine {
             e.setBuffer(vx, offset: 0, index: 3)
             e.setBuffer(vhbuf, offset: 0, index: 4)
             e.setBuffer(vPosInterp, offset: 0, index: 5)
-            grid(e, Dims.vitFF / 32, npTiles, 128)
+            grid(e, Dims.vitFF / 128, npTiles, 128)
 
             // MLP fc2 + residual on Neural Accelerators (MODE 1: outf += X @ W^T + bias)
             e.setComputePipelineState(pVitFc2)
@@ -406,7 +406,7 @@ public final class Engine {
             e.setBuffer(vx, offset: 0, index: 3)
             e.setBuffer(vxn, offset: 0, index: 4)
             e.setBuffer(vPosInterp, offset: 0, index: 5)
-            grid(e, Dims.vitHidden / 32, npTiles, 128)
+            grid(e, Dims.vitHidden / 128, npTiles, 128)
 
             // DeepStack mergers at layers 5, 11, 17 (use_postshuffle_norm = True: LN over 4096)
             if let dsIdx = Dims.deepstackLayers.firstIndex(of: l) {
@@ -425,7 +425,7 @@ public final class Engine {
                 e.setBuffer(vx, offset: 0, index: 3)
                 e.setBuffer(vhbuf, offset: 0, index: 4)
                 e.setBuffer(vPosInterp, offset: 0, index: 5)
-                grid(e, Dims.mergerHidden / 32, visTiles, 128)
+                grid(e, Dims.mergerHidden / 128, visTiles, 128)
 
                 e.setComputePipelineState(pMergerFc2)
                 e.setBuffer(vhbuf, offset: 0, index: 0)
@@ -434,7 +434,7 @@ public final class Engine {
                 e.setBuffer(deepstackBufs[dsIdx], offset: 0, index: 3)
                 e.setBuffer(vxn, offset: 0, index: 4)
                 e.setBuffer(vPosInterp, offset: 0, index: 5)
-                grid(e, Dims.hidden / 32, visTiles, 128)
+                grid(e, Dims.hidden / 128, visTiles, 128)
             }
         }
 
@@ -455,7 +455,7 @@ public final class Engine {
         e.setBuffer(vx, offset: 0, index: 3)
         e.setBuffer(vhbuf, offset: 0, index: 4)
         e.setBuffer(vPosInterp, offset: 0, index: 5)
-        grid(e, Dims.mergerHidden / 32, visTiles, 128)
+        grid(e, Dims.mergerHidden / 128, visTiles, 128)
 
         e.setComputePipelineState(pMergerFc2)
         e.setBuffer(vhbuf, offset: 0, index: 0)
@@ -464,7 +464,7 @@ public final class Engine {
         e.setBuffer(poolerBuf, offset: 0, index: 3)
         e.setBuffer(vxn, offset: 0, index: 4)
         e.setBuffer(vPosInterp, offset: 0, index: 5)
-        grid(e, Dims.hidden / 32, visTiles, 128)
+        grid(e, Dims.hidden / 128, visTiles, 128)
     }
 
     // Encodes one LLM decoder layer `l` for `n` tokens.
