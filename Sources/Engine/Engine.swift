@@ -349,7 +349,7 @@ public final class Engine {
             w(e, TensorID.vitLayer(l, TensorID.vNorm1B), 2)
             e.setBuffer(vxn, offset: 0, index: 3)
             e.setBytes(&np, length: 4, index: 4)
-            grid(e, Int(np), 1, 256)
+            grid(e, (Int(np) + 3) / 4, 1, 128)
 
             // QKV + 2D Vision RoPE on Neural Accelerators -> head-major fp16 vq, vk, vv
             e.setComputePipelineState(pVitQkv)
@@ -391,7 +391,7 @@ public final class Engine {
             w(e, TensorID.vitLayer(l, TensorID.vNorm2B), 2)
             e.setBuffer(vxn, offset: 0, index: 3)
             e.setBytes(&np, length: 4, index: 4)
-            grid(e, Int(np), 1, 256)
+            grid(e, (Int(np) + 3) / 4, 1, 128)
 
             // MLP fc1 (GELU tanh) on Neural Accelerators (MODE 2: outh = half(gelu_tanh(X @ W^T + bias)))
             e.setComputePipelineState(pVitFc1)
@@ -451,7 +451,7 @@ public final class Engine {
         w(e, TensorID.merger(finalIdx, TensorID.mNormB), 2)
         e.setBuffer(vxn, offset: 0, index: 3)
         e.setBytes(&np, length: 4, index: 4)
-        grid(e, Int(np), 1, 256)
+        grid(e, (Int(np) + 3) / 4, 1, 128)
 
         e.setComputePipelineState(pMergerFc1)
         e.setBuffer(vxn, offset: 0, index: 0)
@@ -485,7 +485,7 @@ public final class Engine {
             w(e, L(TensorID.attnNorm), 1)
             e.setBuffer(xh, offset: 0, index: 2)
             e.setBuffer(state, offset: 0, index: 3)
-            grid(e, n, 1, 256)
+            grid(e, (n + 3) / 4, 1, 128)
 
             e.setComputePipelineState(pG3Qkv)
             e.setBuffer(xh, offset: 0, index: 0)
@@ -505,7 +505,7 @@ public final class Engine {
             e.setBuffer(rope, offset: 0, index: 6)
             e.setBuffer(state, offset: 0, index: 7)
             e.setBuffer(vq, offset: 0, index: 8)
-            grid(e, 32, n, 128)
+            grid(e, 8, n, 128)
         } else {
             e.setComputePipelineState(pAttnIn)
             w(e, L(TensorID.wqkv), 0)
@@ -567,7 +567,7 @@ public final class Engine {
             w(e, L(TensorID.mlpNorm), 1)
             e.setBuffer(xh, offset: 0, index: 2)
             e.setBuffer(state, offset: 0, index: 3)
-            grid(e, activeRows, 1, 256)
+            grid(e, (activeRows + 3) / 4, 1, 128)
 
             e.setComputePipelineState(pG3Gu)
             e.setBuffer(xh, offset: 0, index: 0)

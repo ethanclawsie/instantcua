@@ -111,53 +111,98 @@ kernel void k_vit_patchify_rgb(device const uchar* rgb [[buffer(0)]],
     }
 }
 
-// Standard LayerNorm over D columns outputting fp16 for Neural Accelerator GEMM consumption.
-// Grid (nrows), 256 threads.
-template<int D>
-kernel void k_layernorm_h_T(device const float* x [[buffer(0)]],
-                            device const float* w [[buffer(1)]],
-                            device const float* b [[buffer(2)]],
-                            device half* out [[buffer(3)]],
-                            constant int& nrows [[buffer(4)]],
-                            uint r [[threadgroup_position_in_grid]],
-                            uint tid [[thread_index_in_threadgroup]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint sg [[simdgroup_index_in_threadgroup]]) {
+// Vectorized zero-barrier LayerNorm over 1024 columns outputting fp16 (4 rows per threadgroup, 1 row per simdgroup).
+// Grid ((nrows + 3) / 4), 128 threads (4 simdgroups).
+kernel void k_vit_ln1024(device const float* x [[buffer(0)]],
+                         device const float* w [[buffer(1)]],
+                         device const float* b [[buffer(2)]],
+                         device half* out [[buffer(3)]],
+                         constant int& nrows [[buffer(4)]],
+                         uint tgp [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
+    const int r = int(tgp * 4 + sg);
+    if (r >= nrows) return;
+    device const float4* xr4 = (device const float4*)(x + (ulong)r * 1024);
+    device const float4* w4 = (device const float4*)w;
+    device const float4* b4 = (device const float4*)b;
+    device half4* yr4 = (device half4*)(out + (ulong)r * 1024);
+    float4 xv[8];
+    float sum = 0.f;
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 8; ++k) {
+        const float4 v = xr4[lane + k * 32];
+        xv[k] = v;
+        sum += v.x + v.y + v.z + v.w;
+    }
+    const float mean = simd_sum(sum) * (1.0f / 1024.0f);
+    float vsum = 0.f;
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 8; ++k) {
+        const float4 d = xv[k] - mean;
+        xv[k] = d;
+        vsum += dot(d, d);
+    }
+    const float inv_std = rsqrt(simd_sum(vsum) * (1.0f / 1024.0f) + EPS);
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 8; ++k) {
+        const uint idx = lane + k * 32;
+        yr4[idx] = half4(xv[k] * inv_std * w4[idx] + b4[idx]);
+    }
+}
+
+// Vectorized LayerNorm over 4096 columns outputting fp16 (register-cached single-read float4/half4).
+// Grid (nrows), 256 threads (8 simdgroups).
+kernel void k_vit_ln4096(device const float* x [[buffer(0)]],
+                         device const float* w [[buffer(1)]],
+                         device const float* b [[buffer(2)]],
+                         device half* out [[buffer(3)]],
+                         constant int& nrows [[buffer(4)]],
+                         uint r [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
     if ((int)r >= nrows) return;
     threadgroup float red_m[8];
     threadgroup float red_v[8];
-    device const float* xr = x + r * D;
+    device const float4* xr4 = (device const float4*)(x + (ulong)r * 4096);
+    device const float4* w4 = (device const float4*)w;
+    device const float4* b4 = (device const float4*)b;
+    device half4* yr4 = (device half4*)(out + (ulong)r * 4096);
+    float4 xv[4];
     float sum = 0.f;
-    for (int i = tid; i < D; i += 256) sum += xr[i];
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 4; ++k) {
+        const float4 v = xr4[tid + k * 256];
+        xv[k] = v;
+        sum += v.x + v.y + v.z + v.w;
+    }
     sum = simd_sum(sum);
     if (lane == 0) red_m[sg] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float mean = (red_m[0] + red_m[1] + red_m[2] + red_m[3] + red_m[4] + red_m[5] + red_m[6] + red_m[7]) / float(D);
+    const float mean = (red_m[0] + red_m[1] + red_m[2] + red_m[3] + red_m[4] + red_m[5] + red_m[6] + red_m[7]) * (1.0f / 4096.0f);
     float vsum = 0.f;
-    for (int i = tid; i < D; i += 256) {
-        const float d = xr[i] - mean;
-        vsum += d * d;
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 4; ++k) {
+        const float4 d = xv[k] - mean;
+        xv[k] = d;
+        vsum += dot(d, d);
     }
     vsum = simd_sum(vsum);
     if (lane == 0) red_v[sg] = vsum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inv_std = rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3] + red_v[4] + red_v[5] + red_v[6] + red_v[7]) / float(D) + EPS);
-    device half* yr = out + r * D;
-    for (int i = tid; i < D; i += 256) {
-        yr[i] = half((xr[i] - mean) * inv_std * w[i] + b[i]);
+    const float inv_std = rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3] + red_v[4] + red_v[5] + red_v[6] + red_v[7]) * (1.0f / 4096.0f) + EPS);
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 4; ++k) {
+        const uint idx = tid + k * 256;
+        yr4[idx] = half4(xv[k] * inv_std * w4[idx] + b4[idx]);
     }
 }
 
-template [[host_name("k_vit_ln1024")]] kernel void k_layernorm_h_T<1024>(device const float*, device const float*, device const float*, device half*, constant int&, uint, uint, uint, uint);
-template [[host_name("k_vit_ln4096")]] kernel void k_layernorm_h_T<4096>(device const float*, device const float*, device const float*, device half*, constant int&, uint, uint, uint, uint);
-
-// M5 Neural Accelerator (matmul2d) ViT QKV projection + 2D Vision RoPE:
-// Each threadgroup computes one 64-dim head (h_all = 0..47) across TT = 32 patches.
-// Simdgroups 0,1 compute head dims 0..31 and simdgroups 2,3 compute head dims 32..63 (16 KiB shared memory).
-// Grid (48, np / 32), 128 threads.
 // ViT QKV projection + 2D Vision RoPE on M5 Neural Accelerators (matmul2d).
 // 4-simdgroup data-parallel: each threadgroup computes 2 head-blocks (128 output rows = 4 x 32 rows),
 // so all 4 simdgroups compute the full K=1024 reduction without split-K and share X in L1 cache.
+// Epilogue runs in two waves over an 8 KiB [2][TT][32] buffer: simdgroups 0,1 (head 0) then 2,3 (head 1).
 // Grid (24, np / 32) = (24, 30), 128 threads (4 simdgroups).
 kernel void k_vit_qkv(device half* X [[buffer(0)]],
                       device half* W [[buffer(1)]],
@@ -177,7 +222,7 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
     if (t0 >= np) return;
 
     const uint r_sg = tgp.x * 128 + sg * 32;
-    threadgroup float Os[4 * TT * 32]; // 16 KiB total (allows 2 threadgroups/core on M5)
+    threadgroup float Os[2 * TT * 32]; // 8 KiB total (allows 4 threadgroups/core occupancy on M5)
 
     auto tX = tensor(X + (ulong)t0 * VH, dextents<int, 2>(VH, TT), array<int, 2>({1, VH}));
     auto tW = tensor(W + (ulong)r_sg * VH, dextents<int, 2>(VH, 32), array<int, 2>({1, VH}));
@@ -194,47 +239,52 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
         op.run(a, b, cT);
     }
 
-    auto tO = tensor(Os + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
-    cT.store(tO);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // sg 0..1 handle head_in_tg = 0 (t_sub = 0, 16); sg 2..3 handle head_in_tg = 1 (t_sub = 0, 16)
     const uint head_in_tg = sg >> 1;
     const int h_all = int(tgp.x * 2 + head_in_tg);
     const uint r0 = uint(h_all * 64);
     const int t_sub = int(sg & 1) * 16;
     const float b0 = bias[r0 + lane];
     const float b1 = bias[r0 + 32 + lane];
-    threadgroup const float* O0 = Os + (head_in_tg * 2 + 0) * TT * 32;
-    threadgroup const float* O1 = Os + (head_in_tg * 2 + 1) * TT * 32;
+    auto tO = tensor(Os + (sg & 1) * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
 
-    for (int dt = 0; dt < 16; ++dt) {
-        const int t = t_sub + dt;
-        const int p = t0 + t;
-        if (p >= np) continue;
-        float a = b0 + O0[t * 32 + lane];
-        float b = b1 + O1[t * 32 + lane];
-        if (h_all < 32) {
-            const float2 cs = vrope[p * 32 + lane];
-            const float a2 = a * cs.x - b * cs.y;
-            const float b2 = b * cs.x + a * cs.y;
-            a = a2; b = b2;
+    for (uint wave = 0; wave < 2; ++wave) {
+        if (head_in_tg == wave) {
+            cT.store(tO);
         }
-        if (h_all < 16) {
-            device half* qdst = vq + ((ulong)h_all * np + p) * VHD;
-            qdst[lane] = half(a);
-            qdst[lane + 32] = half(b);
-        } else if (h_all < 32) {
-            const int kh = h_all - 16;
-            device half* kdst = vk + ((ulong)kh * np + p) * VHD;
-            kdst[lane] = half(a);
-            kdst[lane + 32] = half(b);
-        } else {
-            const int vh = h_all - 32;
-            device half* vdst = vv + ((ulong)vh * np + p) * VHD;
-            vdst[lane] = half(a);
-            vdst[lane + 32] = half(b);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (head_in_tg == wave) {
+            threadgroup const float* O0 = Os;
+            threadgroup const float* O1 = Os + TT * 32;
+            for (int dt = 0; dt < 16; ++dt) {
+                const int t = t_sub + dt;
+                const int p = t0 + t;
+                if (p >= np) continue;
+                float a = b0 + O0[t * 32 + lane];
+                float b = b1 + O1[t * 32 + lane];
+                if (h_all < 32) {
+                    const float2 cs = vrope[p * 32 + lane];
+                    const float a2 = a * cs.x - b * cs.y;
+                    const float b2 = b * cs.x + a * cs.y;
+                    a = a2; b = b2;
+                }
+                if (h_all < 16) {
+                    device half* qdst = vq + ((ulong)h_all * np + p) * VHD;
+                    qdst[lane] = half(a);
+                    qdst[lane + 32] = half(b);
+                } else if (h_all < 32) {
+                    const int kh = h_all - 16;
+                    device half* kdst = vk + ((ulong)kh * np + p) * VHD;
+                    kdst[lane] = half(a);
+                    kdst[lane + 32] = half(b);
+                } else {
+                    const int vh = h_all - 32;
+                    device half* vdst = vv + ((ulong)vh * np + p) * VHD;
+                    vdst[lane] = half(a);
+                    vdst[lane + 32] = half(b);
+                }
+            }
         }
+        if (wave == 0) threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -342,7 +392,7 @@ kernel void k_vit_attn(device half* vq [[buffer(0)]],
 
 // Generic M5 Neural Accelerator (matmul2d) fp16 linear kernel for ViT & Mergers:
 // Each of the 4 simdgroups computes an independent 32-row output slice (r_sg = tgp.x * 128 + sg * 32),
-// sharing the exact same X tile in L1 cache at every k0 step with zero cross-simdgroup barrier!
+// sharing the exact same X tile in L1 cache at every k0 step with 8 KiB shared memory (4 TGs/core on M5)!
 // Grid (ROWS / 128, nrows / TT), 128 threads (4 simdgroups).
 template<int K, int ROWS, int MODE, int TT>
 kernel void k_vit_gemm_T(device half* X [[buffer(0)]],
@@ -358,8 +408,8 @@ kernel void k_vit_gemm_T(device half* X [[buffer(0)]],
     constexpr int NSTEP = K / BK;
     const uint r0 = tgp.x * 128 + sg * 32;
     const uint t0 = tgp.y * TT;
-    threadgroup float Os[4 * TT * 32]; // 16 KiB (each simdgroup owns its own [TT, 32] slice)
-    threadgroup float* myO = Os + sg * TT * 32;
+    threadgroup float Os[2 * TT * 32]; // 8 KiB (allows 4 threadgroups/core occupancy on M5)
+    threadgroup float* myO = Os + (sg & 1) * TT * 32;
 
     auto tX = tensor(X + (ulong)t0 * K, dextents<int, 2>(K, TT), array<int, 2>({1, K}));
     auto tW = tensor(W + (ulong)r0 * K, dextents<int, 2>(K, 32), array<int, 2>({1, K}));
@@ -376,19 +426,23 @@ kernel void k_vit_gemm_T(device half* X [[buffer(0)]],
         op.run(a, b, cT);
     }
 
-    auto tO = tensor(myO, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
-    cT.store(tO);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
-
     const float b_val = bias[r0 + lane];
-    for (int t = 0; t < TT; ++t) {
-        const float v = myO[t * 32 + lane] + b_val;
-        const ulong idx = (ulong)(t0 + t) * ROWS + r0 + lane;
-        if (MODE == 0) outf[idx] = v;
-        else if (MODE == 1) outf[idx] += v;
-        else if (MODE == 2) outh[idx] = half(gelu_tanh(v));
-        else if (MODE == 3) outh[idx] = half(gelu_exact(v));
-        else if (MODE == 4) outf[idx] = v + pos_interp[idx];
+    auto tO = tensor(myO, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
+    for (uint wave = 0; wave < 2; ++wave) {
+        if ((sg >> 1) == wave) {
+            cT.store(tO);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int t = 0; t < TT; ++t) {
+                const float v = myO[t * 32 + lane] + b_val;
+                const ulong idx = (ulong)(t0 + t) * ROWS + r0 + lane;
+                if (MODE == 0) outf[idx] = v;
+                else if (MODE == 1) outf[idx] += v;
+                else if (MODE == 2) outh[idx] = half(gelu_tanh(v));
+                else if (MODE == 3) outh[idx] = half(gelu_exact(v));
+                else if (MODE == 4) outf[idx] = v + pos_interp[idx];
+            }
+        }
+        if (wave == 0) threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -779,44 +833,41 @@ kernel void k_attn_in(device const wtype* W [[buffer(0)]],
     }
 }
 
-// Normalizes n rows of x [n, H] by w [H] and writes fp16 xh [n, H].
-// Grid (n), 256 threads (8 simdgroups).
+// Vectorized zero-barrier RMSNorm over H=2048 columns outputting fp16 xh [n, H] (4 rows per threadgroup, 1 row per simdgroup).
+// Grid ((n + 3) / 4), 128 threads (4 simdgroups).
 kernel void k_rmsnorm_rows_h(device const float* x [[buffer(0)]],
                              device const float* w [[buffer(1)]],
                              device half* xh [[buffer(2)]],
                              device const State* st [[buffer(3)]],
-                             uint t [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]],
+                             uint tgp [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]]) {
-    if (st->done || (int)t >= st->n) return;
-    threadgroup float red[8];
-    device const float* xr = x + (ulong)t * H;
-    device half* yd = xh + (ulong)t * H;
+    const int t = int(tgp * 4 + sg);
+    if (st->done || t >= st->n) return;
+    device const float4* xr4 = (device const float4*)(x + (ulong)t * H);
+    device const float4* w4 = (device const float4*)w;
+    device half4* yd4 = (device half4*)(xh + (ulong)t * H);
+    float4 xv[16];
     float ss = 0.f;
-    for (uint i = tid; i < H; i += 256) {
-        const float v = xr[i];
-        ss += v * v;
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 16; ++k) {
+        const float4 v = xr4[lane + k * 32];
+        xv[k] = v;
+        ss += dot(v, v);
     }
-    ss = simd_sum(ss);
-    if (lane == 0) red[sg] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (sg == 0) {
-        ss = (lane < 8) ? red[lane] : 0.f;
-        ss = simd_sum(ss);
-        if (lane == 0) red[0] = rsqrt(ss / float(H) + EPS);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float scale = red[0];
-    for (uint i = tid; i < H; i += 256) {
-        yd[i] = half(xr[i] * scale * w[i]);
+    const float scale = rsqrt(simd_sum(ss) * (1.0f / float(H)) + EPS);
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 16; ++k) {
+        const uint idx = lane + k * 32;
+        yd4[idx] = half4(xv[k] * scale * w4[idx]);
     }
 }
 
 #define MAXPASS_Q 512
 
-// Per-head RMSNorm(128) on Q (heads 0..15) and K (heads 16..23) + 3D M-RoPE + KV cache write.
-// Grid (32, n), 128 threads (4 simdgroups).
+// Vectorized zero-barrier per-head RMSNorm(128) on Q (heads 0..15) and K (heads 16..23) + 3D M-RoPE + KV cache write.
+// Each simdgroup (32 lanes) processes 1 full 128-dim head in registers with zero shared memory and zero barriers!
+// Grid (8, n), 128 threads (4 simdgroups x 1 head = 4 heads per threadgroup).
 kernel void k_qk_norm_rope(device const float* qkv [[buffer(0)]],
                            device const float* qnorm [[buffer(1)]],
                            device const float* knorm [[buffer(2)]],
@@ -827,49 +878,47 @@ kernel void k_qk_norm_rope(device const float* qkv [[buffer(0)]],
                            device const State* st [[buffer(7)]],
                            device half* qh [[buffer(8)]],
                            uint2 tgp [[threadgroup_position_in_grid]],
-                           uint tid [[thread_index_in_threadgroup]],
                            ushort lane [[thread_index_in_simdgroup]],
                            ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (st->done) return;
-    const int head = tgp.x; // 0..31
-    const int t = tgp.y;
+    const int head = int(tgp.x * 4 + sg); // 0..31
+    if (head >= 32) return;
+    const int t = int(tgp.y);
     if (t >= st->n) return;
-    threadgroup float hv[128];
-    threadgroup float red_h[4];
 
-    const float val = qkv[(ulong)t * QKV_DIM + head * HD + tid];
+    device const float2* src2 = (device const float2*)(qkv + (ulong)t * QKV_DIM + head * HD);
     const int pos = st->pos + t;
     if (head < 24) {
-        float ss = simd_sum(val * val);
-        if (lane == 0) red_h[sg] = ss;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        const float hscale = rsqrt((red_h[0] + red_h[1] + red_h[2] + red_h[3]) / float(HD) + EPS);
-        device const float* nw = (head < 16) ? qnorm : knorm;
-        hv[tid] = val * hscale * nw[tid];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float2 a = src2[lane];
+        float2 b = src2[lane + 32];
+        const float ss = dot(a, a) + dot(b, b);
+        const float hscale = rsqrt(simd_sum(ss) * (1.0f / float(HD)) + EPS);
+        device const float2* nw2 = (device const float2*)((head < 16) ? qnorm : knorm);
+        a *= hscale * nw2[lane];
+        b *= hscale * nw2[lane + 32];
 
-        if (tid < 64) {
-            const float2 cs = rope[pos * 64 + tid];
-            const float a = hv[tid], b = hv[tid + 64];
-            const float a2 = a * cs.x - b * cs.y;
-            const float b2 = b * cs.x + a * cs.y;
-            if (head < 16) {
-                if (t == st->n - 1) {
-                    q[(ulong)t * H + head * HD + tid] = a2;
-                    q[(ulong)t * H + head * HD + tid + 64] = b2;
-                }
-                device half* qhd = qh + ((ulong)head * MAXPASS_Q + t) * HD;
-                qhd[tid] = half(a2);
-                qhd[tid + 64] = half(b2);
-            } else {
-                device half* k = kc + ((ulong)(head - 16) * st->maxctx + pos) * HD;
-                k[tid] = half(a2);
-                k[tid + 64] = half(b2);
+        const float2 cs0 = rope[pos * 64 + lane * 2 + 0];
+        const float2 cs1 = rope[pos * 64 + lane * 2 + 1];
+        const float2 a2 = float2(a.x * cs0.x - b.x * cs0.y, a.y * cs1.x - b.y * cs1.y);
+        const float2 b2 = float2(b.x * cs0.x + a.x * cs0.y, b.y * cs1.x + a.y * cs1.y);
+        if (head < 16) {
+            if (t == st->n - 1) {
+                device float2* q2 = (device float2*)(q + (ulong)t * H + head * HD);
+                q2[lane] = a2;
+                q2[lane + 32] = b2;
             }
+            device half2* qh2 = (device half2*)(qh + ((ulong)head * MAXPASS_Q + t) * HD);
+            qh2[lane] = half2(a2);
+            qh2[lane + 32] = half2(b2);
+        } else {
+            device half2* k2 = (device half2*)(kc + ((ulong)(head - 16) * st->maxctx + pos) * HD);
+            k2[lane] = half2(a2);
+            k2[lane + 32] = half2(b2);
         }
     } else {
-        device half* v_dst = vc + ((ulong)(head - 24) * st->maxctx + pos) * HD;
-        v_dst[tid] = half(val);
+        device const float4* src4 = (device const float4*)src2;
+        device half4* v4 = (device half4*)(vc + ((ulong)(head - 24) * st->maxctx + pos) * HD);
+        v4[lane] = half4(src4[lane]);
     }
 }
 
