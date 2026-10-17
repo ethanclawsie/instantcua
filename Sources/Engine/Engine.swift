@@ -29,7 +29,7 @@ public final class Engine {
     let pVitPatchify, pVitPatchEmbed, pVitLN1024, pVitLN4096, pVitQkv, pVitAttn, pVitProj, pVitFc1, pVitFc2: MTLComputePipelineState
     let pMergerFc1, pMergerFc2: MTLComputePipelineState
     let pEmbedPrompt, pDeepstackAdd, pAttnIn, pAttention, pOProj, pMlpIn, pMlpOut, pLMHead, pCommit, pNoop: MTLComputePipelineState
-    let pRmsNormRowsH, pQkNormRope, pG3Qkv, pG3O, pG3Gu, pG3Down: MTLComputePipelineState
+    let pRmsNormRowsH, pQkNormRope, pPrefillAttn, pG3Qkv, pG3O, pG3Gu, pG3Down: MTLComputePipelineState
 
     var residency: MTLResidencySet?
     private var preparedGrid: (Int, Int) = (0, 0)
@@ -170,6 +170,7 @@ public final class Engine {
 
         pRmsNormRowsH = try pipe("k_rmsnorm_rows_h")
         pQkNormRope = try pipe("k_qk_norm_rope")
+        pPrefillAttn = try pipe("k_prefill_attn")
         pG3Qkv = try pipe("k_g3_qkv")
         pG3O = try pipe("k_g3_o")
         pG3Gu = try pipe("k_g3_gu")
@@ -498,6 +499,7 @@ public final class Engine {
             e.setBuffer(vc, offset: kvOff, index: 5)
             e.setBuffer(rope, offset: 0, index: 6)
             e.setBuffer(state, offset: 0, index: 7)
+            e.setBuffer(vq, offset: 0, index: 8)
             grid(e, 32, n, 128)
         } else {
             e.setComputePipelineState(pAttnIn)
@@ -521,15 +523,28 @@ public final class Engine {
         var toff = Int32(isLastPrefill ? (n - 1) : 0)
 
         // 2. Causal GQA attention
-        e.setComputePipelineState(pAttention)
-        e.setBuffer(q, offset: 0, index: 0)
-        e.setBuffer(kc, offset: kvOff, index: 1)
-        e.setBuffer(vc, offset: kvOff, index: 2)
-        e.setBuffer(attn, offset: 0, index: 3)
-        e.setBuffer(state, offset: 0, index: 4)
-        e.setBytes(&toff, length: 4, index: 5)
-        e.setBuffer(attnh, offset: 0, index: 6)
-        grid(e, Dims.heads, activeRows, 256)
+        if activeRows > 1 {
+            e.setComputePipelineState(pPrefillAttn)
+            e.setBuffer(vq, offset: 0, index: 0)
+            e.setBuffer(kc, offset: kvOff, index: 1)
+            e.setBuffer(vc, offset: kvOff, index: 2)
+            e.setBuffer(attn, offset: 0, index: 3)
+            e.setBuffer(attnh, offset: 0, index: 4)
+            e.setBuffer(vscores, offset: 0, index: 5)
+            e.setBuffer(vprobs, offset: 0, index: 6)
+            e.setBuffer(state, offset: 0, index: 7)
+            grid(e, Dims.heads, (activeRows + 15) / 16, 128)
+        } else {
+            e.setComputePipelineState(pAttention)
+            e.setBuffer(q, offset: 0, index: 0)
+            e.setBuffer(kc, offset: kvOff, index: 1)
+            e.setBuffer(vc, offset: kvOff, index: 2)
+            e.setBuffer(attn, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            e.setBytes(&toff, length: 4, index: 5)
+            e.setBuffer(attnh, offset: 0, index: 6)
+            grid(e, Dims.heads, activeRows, 256)
+        }
 
         if activeRows > 1 {
             // 3. Output projection + residual on Neural Accelerators
