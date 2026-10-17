@@ -21,7 +21,7 @@ public final class Engine {
     public let deepstackBufs: [MTLBuffer]
 
     // LLM buffers
-    let x, q, attn, hbuf, kc, vc, state, promptToks, outToks, pval, pidx: MTLBuffer
+    let x, xh, qkvBuf, q, attn, attnh, hbuf, hbufh, kc, vc, state, promptToks, outToks, pval, pidx: MTLBuffer
     public let logits: MTLBuffer
     let rope: MTLBuffer
 
@@ -29,6 +29,7 @@ public final class Engine {
     let pVitPatchify, pVitPatchEmbed, pVitLN1024, pVitLN4096, pVitQkv, pVitAttn, pVitProj, pVitFc1, pVitFc2: MTLComputePipelineState
     let pMergerFc1, pMergerFc2: MTLComputePipelineState
     let pEmbedPrompt, pDeepstackAdd, pAttnIn, pAttention, pOProj, pMlpIn, pMlpOut, pLMHead, pCommit, pNoop: MTLComputePipelineState
+    let pRmsNormRowsH, pQkNormRope, pG3Qkv, pG3O, pG3Gu, pG3Down: MTLComputePipelineState
 
     var residency: MTLResidencySet?
     private var preparedGrid: (Int, Int) = (0, 0)
@@ -94,9 +95,13 @@ public final class Engine {
 
         let H = Dims.hidden
         x = buf(maxPass * H * 4)
+        xh = buf(maxPass * H * 2)
+        qkvBuf = buf(maxPass * Dims.qkvRows * 4)
         q = buf(maxPass * H * 4)
         attn = buf(maxPass * H * 4)
+        attnh = buf(maxPass * H * 2)
         hbuf = buf(maxPass * Dims.ff * 4)
+        hbufh = buf(maxPass * Dims.ff * 2)
         let kvBytes = Dims.layers * Dims.kvHeads * maxContext * Dims.headDim * 2
         kc = buf(kvBytes)
         vc = buf(kvBytes)
@@ -115,11 +120,11 @@ public final class Engine {
         llmInvFreq = invf
 
         let rd = MTLResidencySetDescriptor()
-        rd.initialCapacity = 32
+        rd.initialCapacity = 40
         if pinMemory, let rs = try? dev.makeResidencySet(descriptor: rd) {
             var allBufs: [MTLBuffer] = [
                 wbuf, rgbBuf, patchBuf, vx, vxn, vq, vk, vv, vattn, vhbuf, vscores, vprobs, vPosInterp, vRope, poolerBuf,
-                x, q, attn, hbuf, kc, vc, state, promptToks, outToks, pval, pidx, logits, rope,
+                x, xh, qkvBuf, q, attn, attnh, hbuf, hbufh, kc, vc, state, promptToks, outToks, pval, pidx, logits, rope,
             ]
             allBufs.append(contentsOf: deepstackBufs)
             for b in allBufs { rs.addAllocation(b) }
@@ -162,6 +167,13 @@ public final class Engine {
         pLMHead = try pipe("k_lm_head")
         pCommit = try pipe("k_commit")
         pNoop = try pipe("k_noop")
+
+        pRmsNormRowsH = try pipe("k_rmsnorm_rows_h")
+        pQkNormRope = try pipe("k_qk_norm_rope")
+        pG3Qkv = try pipe("k_g3_qkv")
+        pG3O = try pipe("k_g3_o")
+        pG3Gu = try pipe("k_g3_gu")
+        pG3Down = try pipe("k_g3_down")
 
         prepareVisionGrid(gridH: 24, gridW: 40)
     }
@@ -458,21 +470,50 @@ public final class Engine {
     public func encodeLLMLayer(_ e: MTLComputeCommandEncoder, _ l: Int, n: Int, hasVis: Bool, nVis: Int = 240) {
         let kvOff = l * Dims.kvHeads * maxContext * Dims.headDim * 2
         let L = { TensorID.llmLayer(l, $0) }
+        let nTiles = (n + 31) / 32
 
-        // 1. Fused RMSNorm + QKV + per-head q_norm/k_norm + 3D M-RoPE + KV cache write
-        e.setComputePipelineState(pAttnIn)
-        w(e, L(TensorID.wqkv), 0)
-        w(e, L(TensorID.wqkvSB), 1)
-        w(e, L(TensorID.attnNorm), 2)
-        w(e, L(TensorID.qNorm), 3)
-        w(e, L(TensorID.kNorm), 4)
-        e.setBuffer(x, offset: 0, index: 5)
-        e.setBuffer(q, offset: 0, index: 6)
-        e.setBuffer(kc, offset: kvOff, index: 7)
-        e.setBuffer(vc, offset: kvOff, index: 8)
-        e.setBuffer(rope, offset: 0, index: 9)
-        e.setBuffer(state, offset: 0, index: 10)
-        grid(e, 32, n, 128)
+        // 1. RMSNorm + QKV + per-head q_norm/k_norm + 3D M-RoPE + KV cache write
+        if n > 1 {
+            e.setComputePipelineState(pRmsNormRowsH)
+            e.setBuffer(x, offset: 0, index: 0)
+            w(e, L(TensorID.attnNorm), 1)
+            e.setBuffer(xh, offset: 0, index: 2)
+            e.setBuffer(state, offset: 0, index: 3)
+            grid(e, n, 1, 256)
+
+            e.setComputePipelineState(pG3Qkv)
+            e.setBuffer(xh, offset: 0, index: 0)
+            w(e, L(TensorID.wqkv), 1)
+            w(e, L(TensorID.wqkvSB), 2)
+            e.setBuffer(qkvBuf, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            grid(e, Dims.qkvRows / 32, nTiles, 128)
+
+            e.setComputePipelineState(pQkNormRope)
+            e.setBuffer(qkvBuf, offset: 0, index: 0)
+            w(e, L(TensorID.qNorm), 1)
+            w(e, L(TensorID.kNorm), 2)
+            e.setBuffer(q, offset: 0, index: 3)
+            e.setBuffer(kc, offset: kvOff, index: 4)
+            e.setBuffer(vc, offset: kvOff, index: 5)
+            e.setBuffer(rope, offset: 0, index: 6)
+            e.setBuffer(state, offset: 0, index: 7)
+            grid(e, 32, n, 128)
+        } else {
+            e.setComputePipelineState(pAttnIn)
+            w(e, L(TensorID.wqkv), 0)
+            w(e, L(TensorID.wqkvSB), 1)
+            w(e, L(TensorID.attnNorm), 2)
+            w(e, L(TensorID.qNorm), 3)
+            w(e, L(TensorID.kNorm), 4)
+            e.setBuffer(x, offset: 0, index: 5)
+            e.setBuffer(q, offset: 0, index: 6)
+            e.setBuffer(kc, offset: kvOff, index: 7)
+            e.setBuffer(vc, offset: kvOff, index: 8)
+            e.setBuffer(rope, offset: 0, index: 9)
+            e.setBuffer(state, offset: 0, index: 10)
+            grid(e, 32, n, 128)
+        }
 
         // Last-layer prefill optimization: only the final token's hidden state is needed by lm_head
         let isLastPrefill = (l == Dims.layers - 1 && n > 1)
@@ -487,38 +528,75 @@ public final class Engine {
         e.setBuffer(attn, offset: 0, index: 3)
         e.setBuffer(state, offset: 0, index: 4)
         e.setBytes(&toff, length: 4, index: 5)
+        e.setBuffer(attnh, offset: 0, index: 6)
         grid(e, Dims.heads, activeRows, 256)
 
-        // 3. Output projection + residual
-        e.setComputePipelineState(pOProj)
-        w(e, L(TensorID.wo), 0)
-        w(e, L(TensorID.woSB), 1)
-        e.setBuffer(attn, offset: 0, index: 2)
-        e.setBuffer(x, offset: 0, index: 3)
-        e.setBuffer(state, offset: 0, index: 4)
-        e.setBytes(&toff, length: 4, index: 5)
-        grid(e, Dims.hidden / 16, activeRows, 64)
+        if activeRows > 1 {
+            // 3. Output projection + residual on Neural Accelerators
+            e.setComputePipelineState(pG3O)
+            e.setBuffer(attnh, offset: 0, index: 0)
+            w(e, L(TensorID.wo), 1)
+            w(e, L(TensorID.woSB), 2)
+            e.setBuffer(x, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            grid(e, Dims.hidden / 32, nTiles, 128)
 
-        // 4. MLP gate/up + SwiGLU
-        e.setComputePipelineState(pMlpIn)
-        w(e, L(TensorID.wgu), 0)
-        w(e, L(TensorID.wguSB), 1)
-        w(e, L(TensorID.mlpNorm), 2)
-        e.setBuffer(x, offset: 0, index: 3)
-        e.setBuffer(hbuf, offset: 0, index: 4)
-        e.setBuffer(state, offset: 0, index: 5)
-        e.setBytes(&toff, length: 4, index: 6)
-        grid(e, Dims.ff / 8, activeRows, 64)
+            // 4. MLP RMSNorm + gate/up + SwiGLU on Neural Accelerators
+            e.setComputePipelineState(pRmsNormRowsH)
+            e.setBuffer(x, offset: 0, index: 0)
+            w(e, L(TensorID.mlpNorm), 1)
+            e.setBuffer(xh, offset: 0, index: 2)
+            e.setBuffer(state, offset: 0, index: 3)
+            grid(e, activeRows, 1, 256)
 
-        // 5. MLP down + residual
-        e.setComputePipelineState(pMlpOut)
-        w(e, L(TensorID.wd), 0)
-        w(e, L(TensorID.wdSB), 1)
-        e.setBuffer(hbuf, offset: 0, index: 2)
-        e.setBuffer(x, offset: 0, index: 3)
-        e.setBuffer(state, offset: 0, index: 4)
-        e.setBytes(&toff, length: 4, index: 5)
-        grid(e, Dims.hidden / 16, activeRows, 64)
+            e.setComputePipelineState(pG3Gu)
+            e.setBuffer(xh, offset: 0, index: 0)
+            w(e, L(TensorID.wgu), 1)
+            w(e, L(TensorID.wguSB), 2)
+            e.setBuffer(hbufh, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            grid(e, Dims.ff / 32, nTiles, 128)
+
+            // 5. MLP down + residual on Neural Accelerators
+            e.setComputePipelineState(pG3Down)
+            e.setBuffer(hbufh, offset: 0, index: 0)
+            w(e, L(TensorID.wd), 1)
+            w(e, L(TensorID.wdSB), 2)
+            e.setBuffer(x, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            grid(e, Dims.hidden / 32, nTiles, 128)
+        } else {
+            // 3. Output projection + residual (1-token decode or last-layer final token)
+            e.setComputePipelineState(pOProj)
+            w(e, L(TensorID.wo), 0)
+            w(e, L(TensorID.woSB), 1)
+            e.setBuffer(attn, offset: 0, index: 2)
+            e.setBuffer(x, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            e.setBytes(&toff, length: 4, index: 5)
+            grid(e, Dims.hidden / 16, activeRows, 64)
+
+            // 4. MLP gate/up + SwiGLU
+            e.setComputePipelineState(pMlpIn)
+            w(e, L(TensorID.wgu), 0)
+            w(e, L(TensorID.wguSB), 1)
+            w(e, L(TensorID.mlpNorm), 2)
+            e.setBuffer(x, offset: 0, index: 3)
+            e.setBuffer(hbuf, offset: 0, index: 4)
+            e.setBuffer(state, offset: 0, index: 5)
+            e.setBytes(&toff, length: 4, index: 6)
+            grid(e, Dims.ff / 8, activeRows, 64)
+
+            // 5. MLP down + residual
+            e.setComputePipelineState(pMlpOut)
+            w(e, L(TensorID.wd), 0)
+            w(e, L(TensorID.wdSB), 1)
+            e.setBuffer(hbuf, offset: 0, index: 2)
+            e.setBuffer(x, offset: 0, index: 3)
+            e.setBuffer(state, offset: 0, index: 4)
+            e.setBytes(&toff, length: 4, index: 5)
+            grid(e, Dims.hidden / 16, activeRows, 64)
+        }
 
         // 6. DeepStack feature addition at layers 0, 1, 2 during prefill
         if hasVis && l < Dims.numDeepstack {
