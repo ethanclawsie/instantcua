@@ -1,0 +1,122 @@
+[
+  {
+    "expectedAction" : "click",
+    "id" : "01_dialog_save",
+    "image" : "bench\/images\/01_dialog_save.png",
+    "prompt" : "Click the 'Save Changes' button.",
+    "targetBox1000" : [
+      555,
+      597,
+      773,
+      716
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "02_browser_search",
+    "image" : "bench\/images\/02_browser_search.png",
+    "prompt" : "Click the 'Search the web...' input box in the center of the page.",
+    "targetBox1000" : [
+      251,
+      441,
+      749,
+      570
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "03_close_window",
+    "image" : "bench\/images\/03_close_window.png",
+    "prompt" : "Click the red close button in the top-left corner of the window.",
+    "targetBox1000" : [
+      135,
+      152,
+      203,
+      244
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "04_settings_toggle",
+    "image" : "bench\/images\/04_settings_toggle.png",
+    "prompt" : "Click the green toggle switch next to 'Enable ProMotion High Refresh Rate'.",
+    "targetBox1000" : [
+      719,
+      368,
+      828,
+      466
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "05_calculator_seven",
+    "image" : "bench\/images\/05_calculator_seven.png",
+    "prompt" : "Click the '7' button on the calculator.",
+    "targetBox1000" : [
+      321,
+      350,
+      426,
+      494
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "06_canvas_play_icon",
+    "image" : "bench\/images\/06_canvas_play_icon.png",
+    "prompt" : "Click the green circular play button in the center of the video player.",
+    "targetBox1000" : [
+      435,
+      376,
+      565,
+      572
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "07_finder_downloads",
+    "image" : "bench\/images\/07_finder_downloads.png",
+    "prompt" : "Click 'Downloads' in the left sidebar.",
+    "targetBox1000" : [
+      76,
+      430,
+      306,
+      538
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "08_login_submit",
+    "image" : "bench\/images\/08_login_submit.png",
+    "prompt" : "Click the blue 'Sign In' button.",
+    "targetBox1000" : [
+      274,
+      597,
+      726,
+      726
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "09_delete_confirm",
+    "image" : "bench\/images\/09_delete_confirm.png",
+    "prompt" : "Click the red 'Delete File' button.",
+    "targetBox1000" : [
+      540,
+      571,
+      757,
+      689
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "10_notification_banner",
+    "image" : "bench\/images\/10_notification_banner.png",
+    "prompt" : "Click the 'Update' button in the top-right notification banner.",
+    "targetBox1000" : [
+      829,
+      105,
+      981,
+      234
+    ]
+  }
+]

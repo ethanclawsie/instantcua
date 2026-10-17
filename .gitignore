@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+.venv/
+models/hf/
+models/gguf/
+models/mlx/
+models/icua/
+scratch/
+*.icua
+*.tkn
+*.bin
+*.pyc
+__pycache__/
+.DS_Store
+bench/competitors/llamacpp/mtmd_bench
