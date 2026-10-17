@@ -279,52 +279,64 @@ kernel void k_vit_attn(device half* vq [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    // Phase 2: Row-wise softmax over 960 keys for each of the 16 query rows (4 rows per simdgroup)
+    // Phase 2: Row-wise softmax over 960 keys in registers (30 keys/lane, zero global writebacks to Sh)
+    const int n_s = (np - int(lane) + 31) >> 5;
     for (int r = int(sg) * 4; r < int(sg) * 4 + 4; ++r) {
-        device float* sr = Sh + r * np;
+        device const float* sr = Sh + r * np;
         device half* pr = Ph + r * np;
+        float row_s[32];
         float m = -INFINITY;
-        for (int s = lane; s < np; s += 32) {
-            const float v = sr[s] * 0.125f;
-            sr[s] = v;
+        for (int k = 0; k < n_s; ++k) {
+            const float v = sr[lane + k * 32] * 0.125f;
+            row_s[k] = v;
             m = max(m, v);
         }
         m = simd_max(m);
         float sum = 0.f;
-        for (int s = lane; s < np; s += 32) {
-            const float e = exp(sr[s] - m);
-            sr[s] = e;
+        for (int k = 0; k < n_s; ++k) {
+            const float e = exp(row_s[k] - m);
+            row_s[k] = e;
             sum += e;
         }
         const float inv_sum = 1.0f / simd_sum(sum);
-        for (int s = lane; s < np; s += 32) {
-            pr[s] = half(sr[s] * inv_sum);
+        for (int k = 0; k < n_s; ++k) {
+            pr[lane + k * 32] = half(row_s[k] * inv_sum);
         }
     }
     threadgroup_barrier(mem_flags::mem_device);
 
     // Phase 3: Ph [16, 960] @ V_h [960, 64] -> O [16, 64] via Neural Accelerators
-    threadgroup float Os[4 * TT * VHD]; // 16 KiB
+    // sg 0..1 compute d0 = 0..31 (2-way split-K), sg 2..3 compute d0 = 32..63 (2-way split-K), using only 8 KiB Os!
+    threadgroup float Os[4 * TT * 32]; // 8 KiB (allows 4 threadgroups/core occupancy on M5)
+    const int d0 = int(sg >> 1) * 32;
+    const int k_sub = int(sg & 1);
     auto tP = tensor(Ph, dextents<int, 2>(np, TT), array<int, 2>({1, np}));
     auto tV = tensor(Vh, dextents<int, 2>(VHD, np), array<int, 2>({1, VHD}));
-    constexpr auto descPV = matmul2d_descriptor(TT, VHD, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto descPV = matmul2d_descriptor(TT, 32, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<descPV, execution_simdgroup> opPV;
-    auto cO = opPV.template get_destination_cooperative_tensor<decltype(tP.template slice<32, TT>(0, 0)), decltype(tV.template slice<VHD, 32>(0, 0)), float>();
+    auto a0 = tP.template slice<32, TT>(0, 0);
+    auto b0 = tV.template slice<32, 32>(d0, 0);
+    auto cO = opPV.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
+    #pragma clang loop unroll(full)
     for (int i = 0; i < cO.get_capacity(); i++) if (cO.is_valid_element(i)) cO[i] = 0.f;
-    for (int kt = sg; kt < nKeyTiles; kt += 4) {
+    for (int kt = k_sub; kt < nKeyTiles; kt += 2) {
         const int s0 = kt * 32;
         auto a = tP.template slice<32, TT>(s0, 0);
-        auto b = tV.template slice<VHD, 32>(0, s0);
+        auto b = tV.template slice<32, 32>(d0, s0);
         opPV.run(a, b, cO);
     }
-    auto tO = tensor(Os + sg * TT * VHD, dextents<int, 2>(VHD, TT), array<int, 2>({1, VHD}));
+    auto tO = tensor(Os + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
     cO.store(tO);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int w = tid; w < TT * VHD; w += 128) {
-        const int t = w / VHD, d = w % VHD;
-        const float val = Os[0 * TT * VHD + w] + Os[1 * TT * VHD + w] + Os[2 * TT * VHD + w] + Os[3 * TT * VHD + w];
-        out[(ulong)(t0 + t) * VH + h * VHD + d] = half(val);
+    // Reduce 2-way split-K and write out [TT, 64]
+    const int t_start = k_sub * (TT / 2);
+    threadgroup const float* O_a = Os + (sg & 2) * TT * 32;
+    threadgroup const float* O_b = O_a + TT * 32;
+    for (int dt = 0; dt < TT / 2; ++dt) {
+        const int r = t_start + dt;
+        const float val = O_a[r * 32 + lane] + O_b[r * 32 + lane];
+        out[(ulong)(t0 + r) * VH + h * VHD + d0 + lane] = half(val);
     }
 }
 
@@ -842,8 +854,10 @@ kernel void k_qk_norm_rope(device const float* qkv [[buffer(0)]],
             const float a2 = a * cs.x - b * cs.y;
             const float b2 = b * cs.x + a * cs.y;
             if (head < 16) {
-                q[(ulong)t * H + head * HD + tid] = a2;
-                q[(ulong)t * H + head * HD + tid + 64] = b2;
+                if (t == st->n - 1) {
+                    q[(ulong)t * H + head * HD + tid] = a2;
+                    q[(ulong)t * H + head * HD + tid + 64] = b2;
+                }
                 device half* qhd = qh + ((ulong)head * MAXPASS_Q + t) * HD;
                 qhd[tid] = half(a2);
                 qhd[tid + 64] = half(b2);
@@ -1084,32 +1098,36 @@ kernel void k_prefill_attn(device half* qh [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    // Phase 2: Causal row-wise softmax for each of the 16 query rows (4 rows per simdgroup)
+    // Phase 2: Causal row-wise softmax in registers (<= 16 keys/lane, zero global writebacks to Sh)
+    const int n_pad = L_pad >> 5;
     for (int r = int(sg) * 4; r < int(sg) * 4 + 4; ++r) {
-        device float* sr = Sh + r * maxctx;
+        device const float* sr = Sh + r * maxctx;
         device half* pr = Ph + r * maxctx;
         if (t0 + r < n) {
             const int L = st->pos + t0 + r + 1;
+            const int n_s = (L - int(lane) + 31) >> 5;
+            float row_s[16];
             float m = -INFINITY;
-            for (int s = int(lane); s < L; s += 32) {
-                const float v = sr[s] * 0.08838834764831845f; // 1 / sqrt(128)
-                sr[s] = v;
+            for (int k = 0; k < n_s; ++k) {
+                const float v = sr[lane + k * 32] * 0.08838834764831845f; // 1 / sqrt(128)
+                row_s[k] = v;
                 m = max(m, v);
             }
             m = simd_max(m);
             float sum = 0.f;
-            for (int s = int(lane); s < L; s += 32) {
-                const float e = exp(sr[s] - m);
-                sr[s] = e;
+            for (int k = 0; k < n_s; ++k) {
+                const float e = exp(row_s[k] - m);
+                row_s[k] = e;
                 sum += e;
             }
             const float inv_sum = 1.0f / simd_sum(sum);
-            for (int s = int(lane); s < L_pad; s += 32) {
-                pr[s] = (s < L) ? half(sr[s] * inv_sum) : 0.h;
+            for (int k = 0; k < n_pad; ++k) {
+                const int s = int(lane) + k * 32;
+                pr[s] = (s < L) ? half(row_s[k] * inv_sum) : 0.h;
             }
         } else {
-            for (int s = int(lane); s < L_pad; s += 32) {
-                pr[s] = 0.h;
+            for (int k = 0; k < n_pad; ++k) {
+                pr[lane + k * 32] = 0.h;
             }
         }
     }
@@ -1144,7 +1162,6 @@ kernel void k_prefill_attn(device half* qh [[buffer(0)]],
         if (t0 + r >= n) continue;
         const float val = myO[r * 32 + lane];
         const ulong idx = (ulong)(t0 + r) * H + h * HD + d0 + lane;
-        out[idx] = val;
         outh[idx] = half(val);
     }
 }
