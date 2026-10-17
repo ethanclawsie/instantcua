@@ -8,7 +8,6 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "instantcua", targets: ["instantcua"]),
-        .executable(name: "icua", targets: ["icua"]),
     ],
     targets: [
         .target(name: "Tokenizer", swiftSettings: release),
@@ -39,10 +38,6 @@ let package = Package(
             name: "instantcua",
             dependencies: ["Engine", "Tokenizer", "Actuator"],
             swiftSettings: release
-        ),
-        .executableTarget(
-            name: "icua",
-            cSettings: [.unsafeFlags(["-O2"])]
         ),
     ],
     swiftLanguageModes: [.v5]

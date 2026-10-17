@@ -41,8 +41,16 @@ struct BenchTask: Codable {
 
 @main
 struct InstantCUACLI {
-    static func main() throws {
-        let args = Array(CommandLine.arguments.dropFirst())
+    static func main() {
+        do {
+            try run(Array(CommandLine.arguments.dropFirst()))
+        } catch {
+            FileHandle.standardError.write(Data("error: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    static func run(_ args: [String]) throws {
         guard let cmd = args.first else {
             printUsage()
             return
@@ -79,7 +87,13 @@ struct InstantCUACLI {
             guard args.count >= 3 else {
                 throw EngineError("usage: instantcua bench <model.icua> <tokenizer.tkn>")
             }
-            try runBench(modelPath: args[1], tokPath: args[2])
+            try runBench(modelPath: args[1], tokPath: args[2], assertAllHit: false)
+
+        case "selftest":
+            guard args.count >= 3 else {
+                throw EngineError("usage: instantcua selftest <model.icua> <tokenizer.tkn>")
+            }
+            try runBench(modelPath: args[1], tokPath: args[2], assertAllHit: true)
 
         case "run":
             guard args.count >= 4 else {
@@ -106,6 +120,7 @@ struct InstantCUACLI {
 
         default:
             printUsage()
+            exit(2)
         }
     }
 
@@ -117,6 +132,7 @@ struct InstantCUACLI {
           convert <hf_dir> <output.icua> [--format f16|q8|q4]
           golden <model.icua> <tokenizer.tkn> <out_dir>
           bench <model.icua> <tokenizer.tkn>
+          selftest <model.icua> <tokenizer.tkn>
           run <model.icua> <tokenizer.tkn> <instruction> [--image <path>] [--dry-run]
         """)
     }
@@ -193,7 +209,7 @@ struct InstantCUACLI {
         print("Summary: \(hits)/\(tasks.count) GUI benchmark tasks hit target bounding box.")
     }
 
-    static func runBench(modelPath: String, tokPath: String) throws {
+    static func runBench(modelPath: String, tokPath: String, assertAllHit: Bool = false) throws {
         let engine = try Engine(modelPath: modelPath)
         let tok = try Tokenizer(path: tokPath)
         let sysPrompt = loadSystemPrompt()
@@ -250,6 +266,9 @@ struct InstantCUACLI {
                      (engine.format.description as NSString).utf8String!,
                      hits, tasks.count,
                      median(visTimes), median(preTimes), tokPerSec, median(totTimes)))
+        if assertAllHit && hits != tasks.count {
+            throw EngineError("selftest failed: only \(hits)/\(tasks.count) tasks hit target bounding box")
+        }
     }
 
     static func runSingle(modelPath: String, tokPath: String, instruction: String, imagePath: String?, dryRun: Bool) throws {
