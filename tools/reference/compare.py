@@ -20,10 +20,22 @@ def cos_sim(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def parse_click(text: str):
-    m = re.search(r"click\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    return None
+    m = re.search(r"click\(([^)]+)\)", text)
+    if not m:
+        return None
+    parts = [p.strip() for p in m.group(1).split(",")]
+    if len(parts) < 2:
+        return None
+    try:
+        vals = []
+        for p in parts:
+            f = float(p)
+            vals.append(int(round(f * 1000.0)) if 0.0 < f <= 1.0 else int(round(f)))
+        if len(vals) >= 4:
+            return (vals[0] + vals[2]) // 2, (vals[1] + vals[3]) // 2
+        return vals[0], vals[1]
+    except ValueError:
+        return None
 
 
 def main():

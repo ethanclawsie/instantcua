@@ -413,43 +413,52 @@ inline float embed_at(device const uchar* E, device const half2* SB, int row, in
 }
 #endif
 
-// Dot product of 64 columns at (row, col64 = c64 * 64) with a lane's xv[64] (and sum X = sum(xv)).
+// Dot product of 64 columns at (row, col64 = c64 * 64) with a lane's xh[16] (64 halfs) and sum X = sum(xh).
 inline float dot64_row(device const wtype* W, device const half2* SB, uint row, uint c64, uint K_cols,
-                       thread const float* xv, float X) {
+                       thread const half4* xh, float X) {
 #if FMT == 0
     device const half4* wp = (device const half4*)(W + (ulong)row * K_cols + c64 * 64);
     float acc = 0.f;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 16; ++i) {
-        acc += dot(float4(wp[i]), float4(xv[4*i], xv[4*i+1], xv[4*i+2], xv[4*i+3]));
+        acc += dot(float4(wp[i]), float4(xh[i]));
     }
     return acc;
 #elif FMT == 1
     device const char4* wp = (device const char4*)(W + (ulong)row * K_cols + c64 * 64);
     device const half* sp = (device const half*)SB + (ulong)row * (K_cols / 32) + c64 * 2;
     float d0 = 0.f, d1 = 0.f;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 8; ++i) {
-        d0 += dot(float4(wp[i]), float4(xv[4*i], xv[4*i+1], xv[4*i+2], xv[4*i+3]));
-        d1 += dot(float4(wp[8 + i]), float4(xv[32 + 4*i], xv[32 + 4*i+1], xv[32 + 4*i+2], xv[32 + 4*i+3]));
+        d0 += dot(float4(wp[i]), float4(xh[i]));
+        d1 += dot(float4(wp[8 + i]), float4(xh[8 + i]));
     }
     return float(sp[0]) * d0 + float(sp[1]) * d1;
 #elif FMT == 2
     device const uint4* wp = (device const uint4*)(W + (ulong)row * (K_cols / 2) + c64 * 32);
     const float2 sb = float2(SB[(ulong)row * (K_cols / 64) + c64]);
-    const uint4 w0 = wp[0], w1 = wp[1];
-    float dq = 0.f;
-    for (int j = 0; j < 4; ++j) {
-        const uint v0 = w0[j];
-        dq += float(v0 & 0xFu) * xv[8*j + 0] + float((v0 >> 4) & 0xFu) * xv[8*j + 1]
-            + float((v0 >> 8) & 0xFu) * xv[8*j + 2] + float((v0 >> 12) & 0xFu) * xv[8*j + 3]
-            + float((v0 >> 16) & 0xFu) * xv[8*j + 4] + float((v0 >> 20) & 0xFu) * xv[8*j + 5]
-            + float((v0 >> 24) & 0xFu) * xv[8*j + 6] + float((v0 >> 28) & 0xFu) * xv[8*j + 7];
-        const uint v1 = w1[j];
-        dq += float(v1 & 0xFu) * xv[32 + 8*j + 0] + float((v1 >> 4) & 0xFu) * xv[32 + 8*j + 1]
-            + float((v1 >> 8) & 0xFu) * xv[32 + 8*j + 2] + float((v1 >> 12) & 0xFu) * xv[32 + 8*j + 3]
-            + float((v1 >> 16) & 0xFu) * xv[32 + 8*j + 4] + float((v1 >> 20) & 0xFu) * xv[32 + 8*j + 5]
-            + float((v1 >> 24) & 0xFu) * xv[32 + 8*j + 6] + float((v1 >> 28) & 0xFu) * xv[32 + 8*j + 7];
+    thread const half2* x2 = (thread const half2*)xh;
+    half2 acc0 = half2(0.h), acc1 = half2(0.h);
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < 2; ++q) {
+        const uint4 wv = wp[q];
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+            const uint v = wv[j];
+            const half2 p04 = as_type<half2>(((v << 6) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p15 = as_type<half2>(((v << 2) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p26 = as_type<half2>(((v >> 2) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p37 = as_type<half2>(((v >> 6) & 0x03C003C0u) | 0x3C003C00u);
+            const int o = q * 16 + j * 4;
+            acc0 = fma(half2(p04.x, p15.x), x2[o + 0], acc0);
+            acc1 = fma(half2(p26.x, p37.x), x2[o + 1], acc1);
+            acc0 = fma(half2(p04.y, p15.y), x2[o + 2], acc0);
+            acc1 = fma(half2(p26.y, p37.y), x2[o + 3], acc1);
+        }
     }
-    return sb.x * dq + sb.y * X;
+    const half2 s2 = acc0 + acc1;
+    const float acc = float(s2.x) + float(s2.y);
+    return (16.f * sb.x) * (acc - X) + sb.y * X;
 #endif
 }
 
@@ -489,38 +498,40 @@ static inline float reduce8(thread float* v, ushort lane) {
     return t1 + simd_shuffle_xor(t1, 1);
 }
 
-// Load lane's 64-column chunk of x (H = 2048 = 32 * 64) and apply RMSNorm(2048, eps=1e-6) * w.
+// Load lane's 64-column chunk of x (H = 2048 = 32 * 64) and apply RMSNorm(2048, eps=1e-6) * w into half4 xh[16].
 static inline void chunk64_norm(device const float* x, device const float* w, ushort lane,
-                                thread float* xv, thread float& X) {
+                                thread half4* xh, thread float& X) {
     device const float4* xs = (device const float4*)(x + lane * 64);
+    float4 xf[16];
     float ss = 0.f;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 16; ++i) {
         const float4 t = xs[i];
-        xv[4*i] = t.x; xv[4*i+1] = t.y; xv[4*i+2] = t.z; xv[4*i+3] = t.w;
+        xf[i] = t;
         ss += dot(t, t);
     }
     ss = simd_sum(ss);
     const float scale = rsqrt(ss / float(H) + EPS);
     device const float4* ws = (device const float4*)(w + lane * 64);
     float sum = 0.f;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 16; ++i) {
-        const float4 wv = ws[i];
-        xv[4*i+0] = xv[4*i+0] * scale * wv.x;
-        xv[4*i+1] = xv[4*i+1] * scale * wv.y;
-        xv[4*i+2] = xv[4*i+2] * scale * wv.z;
-        xv[4*i+3] = xv[4*i+3] * scale * wv.w;
-        sum += xv[4*i+0] + xv[4*i+1] + xv[4*i+2] + xv[4*i+3];
+        const float4 v = xf[i] * scale * ws[i];
+        const half4 h = half4(v);
+        xh[i] = h;
+        sum += float(h.x) + float(h.y) + float(h.z) + float(h.w);
     }
     X = sum;
 }
 
-static inline void chunk64_plain(device const float* x, ushort lane, thread float* xv, thread float& X) {
+static inline void chunk64_plain(device const float* x, ushort lane, thread half4* xh, thread float& X) {
     device const float4* xs = (device const float4*)(x + lane * 64);
     float sum = 0.f;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 16; ++i) {
-        const float4 t = xs[i];
-        xv[4*i] = t.x; xv[4*i+1] = t.y; xv[4*i+2] = t.z; xv[4*i+3] = t.w;
-        sum += t.x + t.y + t.z + t.w;
+        const half4 h = half4(xs[i]);
+        xh[i] = h;
+        sum += float(h.x) + float(h.y) + float(h.z) + float(h.w);
     }
     X = sum;
 }
@@ -590,15 +601,16 @@ kernel void k_attn_in(device const wtype* W [[buffer(0)]],
     threadgroup float hv[128];
     threadgroup float red_h[4];
 
-    float xv[64], X;
-    chunk64_norm(x + (ulong)t * H, wnorm, lane, xv, X);
+    half4 xh[16];
+    float X;
+    chunk64_norm(x + (ulong)t * H, wnorm, lane, xh, X);
 
     // Each of the 4 simdgroups computes 32 rows of this 128-row head in 4 batches of 8 rows.
     const uint r0 = head * HD + sg * 32;
     for (int rb = 0; rb < 32; rb += 8) {
         float v[8];
         for (int b = 0; b < 8; ++b) {
-            v[b] = dot64_row(W, SB, r0 + rb + b, lane, H, xv, X);
+            v[b] = dot64_row(W, SB, r0 + rb + b, lane, H, xh, X);
         }
         const float y = reduce8(v, lane);
         if ((lane & 3) == 0) {
@@ -1062,7 +1074,7 @@ kernel void k_attention(device const float* q [[buffer(0)]],
     threadgroup float qs[HD];
     threadgroup float sc[MAXCTX_TG];
     threadgroup float red[8];
-    threadgroup float part[256];
+    threadgroup float4 part4[256];
     if (tid < HD) qs[tid] = q[(ulong)t * H + h * HD + tid] * 0.08838834764831845f; // 1 / sqrt(128)
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const threadgroup float4* qs4 = (const threadgroup float4*)qs;
@@ -1072,6 +1084,7 @@ kernel void k_attention(device const float* q [[buffer(0)]],
     for (int s = tid; s < L; s += 256) {
         device const half4* kr = (device const half4*)(kb + (ulong)s * HD);
         float a = 0.f;
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 32; ++j) a += dot(float4(kr[j]), qs4[j]);
         sc[s] = a;
         m = max(m, a);
@@ -1093,18 +1106,22 @@ kernel void k_attention(device const float* q [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     sum = 0.f;
     for (int i = 0; i < 8; ++i) sum += red[i];
-    const int d = tid & 127;
-    const int p = tid >> 7;
-    float o = 0.f;
-    for (int s = p; s < L; s += 2) {
-        o += sc[s] * float(vb[(ulong)s * HD + d]);
+
+    // Coalesced half4 V-accumulation: 32 lanes cover all 128 head dims (32 x half4), 8 simdgroups step s += 8
+    float4 o4 = float4(0.f);
+    for (int s = int(sg); s < L; s += 8) {
+        device const half4* vr = (device const half4*)(vb + (ulong)s * HD);
+        o4 += sc[s] * float4(vr[lane]);
     }
-    part[tid] = o;
+    part4[sg * 32 + lane] = o4;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < HD) {
-        const float val = (part[tid] + part[tid + 128]) / sum;
-        out[(ulong)t * H + h * HD + tid] = val;
-        outh[(ulong)t * H + h * HD + tid] = half(val);
+    if (sg == 0) {
+        float4 tot = part4[lane];
+        #pragma clang loop unroll(full)
+        for (int k = 1; k < 8; ++k) tot += part4[k * 32 + lane];
+        const float4 val = tot * (1.0f / sum);
+        ((device float4*)(out + (ulong)t * H + h * HD))[lane] = val;
+        ((device half4*)(outh + (ulong)t * H + h * HD))[lane] = half4(val);
     }
 }
 
@@ -1122,12 +1139,13 @@ kernel void k_o_proj(device const wtype* W [[buffer(0)]],
     if (st->done) return;
     const int t = tgp.y + toff;
     if (t >= st->n) return;
-    float xv[64], X;
-    chunk64_plain(a + (ulong)t * H, lane, xv, X);
+    half4 xh[16];
+    float X;
+    chunk64_plain(a + (ulong)t * H, lane, xh, X);
     const uint r0 = (tgp.x * 2 + sg) * 8;
     float v[8];
     for (int b = 0; b < 8; ++b) {
-        v[b] = dot64_row(W, SB, r0 + b, lane, H, xv, X);
+        v[b] = dot64_row(W, SB, r0 + b, lane, H, xh, X);
     }
     const float y = reduce8(v, lane);
     if ((lane & 3) == 0) {
@@ -1151,13 +1169,14 @@ kernel void k_mlp_in(device const wtype* W [[buffer(0)]],
     if (st->done) return;
     const int t = tgp.y + toff;
     if (t >= st->n) return;
-    float xv[64], X;
-    chunk64_norm(x + (ulong)t * H, wnorm, lane, xv, X);
+    half4 xh[16];
+    float X;
+    chunk64_norm(x + (ulong)t * H, wnorm, lane, xh, X);
     const uint u0 = (tgp.x * 2 + sg) * 4;
     float v[8];
     for (int b = 0; b < 4; ++b) {
-        v[b] = dot64_row(W, SB, u0 + b, lane, H, xv, X);
-        v[4 + b] = dot64_row(W, SB, FF + u0 + b, lane, H, xv, X);
+        v[b] = dot64_row(W, SB, u0 + b, lane, H, xh, X);
+        v[4 + b] = dot64_row(W, SB, FF + u0 + b, lane, H, xh, X);
     }
     const float y = reduce8(v, lane);
     const float up = simd_shuffle_down(y, 16); // row + 4 is the matching up row
@@ -1184,11 +1203,12 @@ kernel void k_mlp_out(device const wtype* W [[buffer(0)]],
     const uint r0 = (tgp.x * 2 + sg) * 8;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int chunk = 0; chunk < 3; ++chunk) {
-        float xv[64], X;
+        half4 xh[16];
+        float X;
         const uint c64 = chunk * 32 + lane;
-        chunk64_plain(hbuf + (ulong)t * FF + chunk * 2048, lane, xv, X);
+        chunk64_plain(hbuf + (ulong)t * FF + chunk * 2048, lane, xh, X);
         for (int b = 0; b < 8; ++b) {
-            acc[b] += dot64_row(W, SB, r0 + b, c64, FF, xv, X);
+            acc[b] += dot64_row(W, SB, r0 + b, c64, FF, xh, X);
         }
     }
     const float y = reduce8(acc, lane);
@@ -1214,13 +1234,14 @@ kernel void k_lm_head(device const wtype* E [[buffer(0)]],
     if (st->done) return;
     threadgroup float bv[4];
     threadgroup int bix[4];
-    float xv[64], X;
+    half4 xh[16];
+    float X;
     device const float* xr = x + (ulong)(st->n - 1) * H;
-    chunk64_norm(xr, wnorm, lane, xv, X);
+    chunk64_norm(xr, wnorm, lane, xh, X);
     const uint r0 = tg * 32 + sg * 8;
     float v[8];
     for (int b = 0; b < 8; ++b) {
-        v[b] = dot64_row(E, ESB, r0 + b, lane, H, xv, X);
+        v[b] = dot64_row(E, ESB, r0 + b, lane, H, xh, X);
     }
     const float y = reduce8(v, lane);
     const int row = int(r0) + (lane >> 2);

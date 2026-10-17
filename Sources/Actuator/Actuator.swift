@@ -54,15 +54,28 @@ public enum ActionParser {
             .components(separatedBy: .whitespacesAndNewlines).last ?? ""
         let inside = String(s[s.index(after: openIdx)..<closeIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        func ints(_ count: Int) -> [Int]? {
+        func coords(_ count: Int) -> [Int]? {
             let parts = inside.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
             guard parts.count >= count else { return nil }
             var res: [Int] = []
-            for i in 0..<count {
-                guard let v = Int(parts[i]) else { return nil }
-                res.append(v)
+            for i in 0..<parts.count {
+                if let v = Int(parts[i]) {
+                    res.append(v)
+                } else if let d = Double(parts[i]) {
+                    res.append(d > 0.0 && d <= 1.0 ? Int((d * 1000.0).rounded()) : Int(d.rounded()))
+                } else {
+                    return nil
+                }
             }
             return res
+        }
+
+        func point2() -> (Int, Int)? {
+            guard let v = coords(2) else { return nil }
+            if v.count >= 4 {
+                return ((v[0] + v[2]) / 2, (v[1] + v[3]) / 2)
+            }
+            return (v[0], v[1])
         }
 
         func quoted() -> String {
@@ -74,29 +87,29 @@ public enum ActionParser {
 
         switch fn {
         case "click":
-            guard let v = ints(2) else { return nil }
-            return .click(x: v[0], y: v[1])
+            guard let (x, y) = point2() else { return nil }
+            return .click(x: x, y: y)
         case "double_click":
-            guard let v = ints(2) else { return nil }
-            return .doubleClick(x: v[0], y: v[1])
+            guard let (x, y) = point2() else { return nil }
+            return .doubleClick(x: x, y: y)
         case "right_click":
-            guard let v = ints(2) else { return nil }
-            return .rightClick(x: v[0], y: v[1])
+            guard let (x, y) = point2() else { return nil }
+            return .rightClick(x: x, y: y)
         case "move":
-            guard let v = ints(2) else { return nil }
-            return .move(x: v[0], y: v[1])
+            guard let (x, y) = point2() else { return nil }
+            return .move(x: x, y: y)
         case "drag":
-            guard let v = ints(4) else { return nil }
+            guard let v = coords(4) else { return nil }
             return .drag(x1: v[0], y1: v[1], x2: v[2], y2: v[3])
         case "type":
             return .typeText(quoted())
         case "key":
             return .key(quoted())
         case "scroll":
-            guard let v = ints(2) else { return nil }
+            guard let v = coords(2) else { return nil }
             return .scroll(dx: v[0], dy: v[1])
         case "wait":
-            guard let v = ints(1) else { return nil }
+            guard let v = coords(1) else { return nil }
             return .wait(ms: v[0])
         case "done":
             return .done
