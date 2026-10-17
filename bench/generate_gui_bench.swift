@@ -103,12 +103,13 @@ func saveScene(_ id: String, draw: (CGContext) -> Void) -> String {
         colorSpaceName: .deviceRGB, bytesPerRow: W * 4, bitsPerPixel: 32
     )!
     NSGraphicsContext.saveGraphicsState()
-    let nsCtx = NSGraphicsContext(bitmapImageRep: rep)!
-    NSGraphicsContext.current = nsCtx
-    let cg = nsCtx.cgContext
-    withTopLeft(cg) {
-        draw(cg)
-    }
+    let baseCtx = NSGraphicsContext(bitmapImageRep: rep)!
+    let cg = baseCtx.cgContext
+    cg.translateBy(x: 0, y: CGFloat(H))
+    cg.scaleBy(x: 1, y: -1)
+    let flippedCtx = NSGraphicsContext(cgContext: cg, flipped: true)
+    NSGraphicsContext.current = flippedCtx
+    draw(cg)
     NSGraphicsContext.restoreGraphicsState()
     let path = "bench/images/\(id).png"
     let data = rep.representation(using: .png, properties: [:])!
@@ -153,13 +154,14 @@ tasks.append(TaskSpec(id: "02_browser_search", image: "bench/images/02_browser_s
 
 // 3. Unlabeled Red Close Button (Traffic Light)
 _ = saveScene("03_close_window") { ctx in
-    drawDesktopChrome(ctx, title: "Notes", winX: 90, winY: 60, winW: 460, winH: 260)
-    drawText("Meeting Notes - Q4 Roadmap", x: 120, y: 115, size: 16, bold: true, color: .black)
-    drawText("- Ship Metal 4 Vision Engine", x: 120, y: 150, size: 13, bold: false, color: .darkGray)
+    drawDesktopChrome(ctx, title: "Notes", winX: 64, winY: 54, winW: 512, winH: 270)
+    fillRect(ctx, 74, 61, 16, 16, 0.96, 0.30, 0.28, radius: 8)
+    drawText("Meeting Notes - Q4 Roadmap", x: 96, y: 110, size: 16, bold: true, color: .black)
+    drawText("- Ship Metal 4 Vision Engine", x: 96, y: 145, size: 13, bold: false, color: .darkGray)
 }
 tasks.append(TaskSpec(id: "03_close_window", image: "bench/images/03_close_window.png",
                       prompt: "Click the red close button in the top-left corner of the window.",
-                      expectedAction: "click", targetBox1000: normBox(96, 64, 24, 24)))
+                      expectedAction: "click", targetBox1000: normBox(70, 58, 24, 24)))
 
 // 4. Dark Mode Settings Toggle
 _ = saveScene("04_settings_toggle") { ctx in

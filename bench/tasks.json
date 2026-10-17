@@ -29,10 +29,10 @@
     "image" : "bench\/images\/03_close_window.png",
     "prompt" : "Click the red close button in the top-left corner of the window.",
     "targetBox1000" : [
-      135,
-      152,
-      203,
-      244
+      94,
+      136,
+      162,
+      229
     ]
   },
   {
