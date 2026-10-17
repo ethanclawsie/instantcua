@@ -155,6 +155,10 @@ template [[host_name("k_vit_ln4096")]] kernel void k_layernorm_h_T<4096>(device 
 // Each threadgroup computes one 64-dim head (h_all = 0..47) across TT = 32 patches.
 // Simdgroups 0,1 compute head dims 0..31 and simdgroups 2,3 compute head dims 32..63 (16 KiB shared memory).
 // Grid (48, np / 32), 128 threads.
+// ViT QKV projection + 2D Vision RoPE on M5 Neural Accelerators (matmul2d).
+// 4-simdgroup data-parallel: each threadgroup computes 2 head-blocks (128 output rows = 4 x 32 rows),
+// so all 4 simdgroups compute the full K=1024 reduction without split-K and share X in L1 cache.
+// Grid (24, np / 32) = (24, 30), 128 threads (4 simdgroups).
 kernel void k_vit_qkv(device half* X [[buffer(0)]],
                       device half* W [[buffer(1)]],
                       device const float* bias [[buffer(2)]],
@@ -164,22 +168,19 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
                       device half* vv [[buffer(6)]],
                       constant int& np [[buffer(7)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
-                      uint tid [[thread_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]]) {
     constexpr int TT = 32;
     constexpr int BK = 64;
-    constexpr int NSTEP = VH / BK / 2; // 1024 / 64 / 2 = 8
-    const int h_all = tgp.x; // 0..47
+    constexpr int NSTEP = VH / BK; // 1024 / 64 = 16
     const int t0 = tgp.y * TT;
     if (t0 >= np) return;
 
-    const uint r0 = h_all * 64;
-    const uint half_idx = sg >> 1; // 0 for dims 0..31, 1 for dims 32..63
-    const uint k_split = sg & 1;   // 0 or 1 along K
+    const uint r_sg = tgp.x * 128 + sg * 32;
     threadgroup float Os[4 * TT * 32]; // 16 KiB total (allows 2 threadgroups/core on M5)
 
     auto tX = tensor(X + (ulong)t0 * VH, dextents<int, 2>(VH, TT), array<int, 2>({1, VH}));
-    auto tW = tensor(W + (ulong)(r0 + half_idx * 32) * VH, dextents<int, 2>(VH, 32), array<int, 2>({1, VH}));
+    auto tW = tensor(W + (ulong)r_sg * VH, dextents<int, 2>(VH, 32), array<int, 2>({1, VH}));
     constexpr auto desc = matmul2d_descriptor(TT, 32, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
     auto cT = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
@@ -187,7 +188,7 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
     for (int i = 0; i < cT.get_capacity(); i++) if (cT.is_valid_element(i)) cT[i] = 0.f;
 
     for (int i = 0; i < NSTEP; i++) {
-        const uint k0 = (k_split * NSTEP + i) * BK;
+        const uint k0 = i * BK;
         auto a = tX.template slice<BK, TT>(k0, 0);
         auto b = tW.template slice<BK, 32>(k0, 0);
         op.run(a, b, cT);
@@ -197,32 +198,42 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
     cT.store(tO);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int w = tid; w < TT * 32; w += 128) {
-        const int t = w / 32, d = w % 32;
+    // sg 0..1 handle head_in_tg = 0 (t_sub = 0, 16); sg 2..3 handle head_in_tg = 1 (t_sub = 0, 16)
+    const uint head_in_tg = sg >> 1;
+    const int h_all = int(tgp.x * 2 + head_in_tg);
+    const uint r0 = uint(h_all * 64);
+    const int t_sub = int(sg & 1) * 16;
+    const float b0 = bias[r0 + lane];
+    const float b1 = bias[r0 + 32 + lane];
+    threadgroup const float* O0 = Os + (head_in_tg * 2 + 0) * TT * 32;
+    threadgroup const float* O1 = Os + (head_in_tg * 2 + 1) * TT * 32;
+
+    for (int dt = 0; dt < 16; ++dt) {
+        const int t = t_sub + dt;
         const int p = t0 + t;
         if (p >= np) continue;
-        float a = bias[r0 + d] + Os[0 * TT * 32 + w] + Os[1 * TT * 32 + w];
-        float b = bias[r0 + 32 + d] + Os[2 * TT * 32 + w] + Os[3 * TT * 32 + w];
+        float a = b0 + O0[t * 32 + lane];
+        float b = b1 + O1[t * 32 + lane];
         if (h_all < 32) {
-            const float2 cs = vrope[p * 32 + d];
+            const float2 cs = vrope[p * 32 + lane];
             const float a2 = a * cs.x - b * cs.y;
             const float b2 = b * cs.x + a * cs.y;
             a = a2; b = b2;
         }
         if (h_all < 16) {
             device half* qdst = vq + ((ulong)h_all * np + p) * VHD;
-            qdst[d] = half(a);
-            qdst[d + 32] = half(b);
+            qdst[lane] = half(a);
+            qdst[lane + 32] = half(b);
         } else if (h_all < 32) {
             const int kh = h_all - 16;
             device half* kdst = vk + ((ulong)kh * np + p) * VHD;
-            kdst[d] = half(a);
-            kdst[d + 32] = half(b);
+            kdst[lane] = half(a);
+            kdst[lane + 32] = half(b);
         } else {
             const int vh = h_all - 32;
             device half* vdst = vv + ((ulong)vh * np + p) * VHD;
-            vdst[d] = half(a);
-            vdst[d + 32] = half(b);
+            vdst[lane] = half(a);
+            vdst[lane + 32] = half(b);
         }
     }
 }
@@ -915,7 +926,6 @@ kernel void k_prefill_attn(device half* qh [[buffer(0)]],
                            device half* probs [[buffer(6)]],
                            device const State* st [[buffer(7)]],
                            uint2 tgp [[threadgroup_position_in_grid]],
-                           uint tid [[thread_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint sg [[simdgroup_index_in_threadgroup]]) {
     constexpr int TT = 16;
@@ -987,8 +997,9 @@ kernel void k_prefill_attn(device half* qh [[buffer(0)]],
     }
     threadgroup_barrier(mem_flags::mem_device);
 
-    // Phase 3: P_tile [16, L_pad] @ V_h [L_pad, 128] -> Os [16, 128]
-    threadgroup float Os[TT * HD]; // 8 KiB
+    // Phase 3: P_tile [16, L_pad] @ V_h [L_pad, 128] -> Os [4, 16, 32] (8 KiB)
+    threadgroup float Os[4 * TT * 32]; // 8 KiB
+    threadgroup float* myO = Os + sg * TT * 32;
     const int d0 = int(sg) * 32;
     auto tP = tensor(Ph, dextents<int, 2>(maxctx, TT), array<int, 2>({1, maxctx}));
     auto tV = tensor(Vh, dextents<int, 2>(HD, L_pad), array<int, 2>({1, HD}));
@@ -1007,16 +1018,16 @@ kernel void k_prefill_attn(device half* qh [[buffer(0)]],
         auto b = tV.template slice<32, 32>(d0, s0);
         opPV.run(a, b, cO);
     }
-    auto tO = tensor(Os + d0, dextents<int, 2>(32, TT), array<int, 2>({1, HD}));
+    auto tO = tensor(myO, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
     cO.store(tO);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (int w = int(tid); w < TT * HD; w += 128) {
-        const int r = w / HD, d = w % HD;
+    for (int r = 0; r < TT; ++r) {
         if (t0 + r >= n) continue;
-        const float val = Os[w];
-        out[(ulong)(t0 + r) * H + h * HD + d] = val;
-        outh[(ulong)(t0 + r) * H + h * HD + d] = half(val);
+        const float val = myO[r * 32 + lane];
+        const ulong idx = (ulong)(t0 + r) * H + h * HD + d0 + lane;
+        out[idx] = val;
+        outh[idx] = half(val);
     }
 }
 

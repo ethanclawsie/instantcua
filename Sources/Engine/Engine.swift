@@ -34,6 +34,11 @@ public final class Engine {
     var residency: MTLResidencySet?
     private var preparedGrid: (Int, Int) = (0, 0)
     private var preparedMRopeKey: (Int, Int, Int) = (-999, 0, 0)
+    private var cachedPrefixTokens: [Int32] = []
+    private var cachedRGBHash: UInt64 = 0
+    private var hasCachedVision: Bool = false
+    public var usePrefixCache: Bool = true
+    public var useVisionDeltaCache: Bool = true
     private let llmInvFreq: [Double]
 
     public struct Timing {
@@ -81,7 +86,7 @@ public final class Engine {
         patchBuf = buf(maxPatches * Dims.vitPatchDim * 4)
         vx = buf(maxPatches * Dims.vitHidden * 4)
         vxn = buf(maxPatches * Dims.vitHidden * 4)
-        vq = buf(maxPatches * Dims.vitHidden * 2)
+        vq = buf(max(maxPatches * Dims.vitHidden * 2, Dims.heads * maxPass * Dims.headDim * 2))
         vk = buf(maxPatches * Dims.vitHidden * 2)
         vv = buf(maxPatches * Dims.vitHidden * 2)
         vattn = buf(maxPatches * Dims.vitHidden * 2)
@@ -356,7 +361,7 @@ public final class Engine {
             e.setBuffer(vk, offset: 0, index: 5)
             e.setBuffer(vv, offset: 0, index: 6)
             e.setBytes(&np, length: 4, index: 7)
-            grid(e, 48, npTiles, 128)
+            grid(e, 24, npTiles, 128)
 
             // Bidirectional full attention on Neural Accelerators -> fp16 vattn
             e.setComputePipelineState(pVitAttn)
@@ -675,6 +680,18 @@ public final class Engine {
         encodeCommit(e)
     }
 
+    @inline(__always)
+    private static func hashRGB(_ ptr: UnsafeRawPointer, byteCount: Int) -> UInt64 {
+        let words = byteCount / 8
+        let p64 = ptr.assumingMemoryBound(to: UInt64.self)
+        var h: UInt64 = 0xcbf29ce484222325
+        for i in 0..<words {
+            h ^= p64[i]
+            h = h &* 0x100000001b3
+        }
+        return h
+    }
+
     // Runs full multimodal inference (Vision + Prefill + GPU-resident greedy decode) on an RGB8 image [H, W, 3].
     public func generateVision(rgbBytes: UnsafeRawPointer, width: Int = 640, height: Int = 384,
                                tokens: [Int32], maxNewTokens: Int = 64, writeFirstLogits: Bool = false) -> [Int32] {
@@ -686,41 +703,67 @@ public final class Engine {
         let llmH = gridH / Dims.vitMergeSize
         let llmW = gridW / Dims.vitMergeSize
 
-        // Copy RGB bytes into shared GPU buffer
-        memcpy(rgbBuf.contents(), rgbBytes, width * height * 3)
+        let byteCount = width * height * 3
+        let rgbHash = Self.hashRGB(rgbBytes, byteCount: byteCount)
+        let skipVision = useVisionDeltaCache && hasCachedVision && (rgbHash == cachedRGBHash) && !writeFirstLogits
+        if !skipVision {
+            memcpy(rgbBuf.contents(), rgbBytes, byteCount)
+            cachedRGBHash = rgbHash
+            hasCachedVision = true
+        }
 
         // Find vision start offset (first IMAGE_PAD_ID = 151655)
         let visOffset = tokens.firstIndex(of: 151655) ?? -1
         prepareMRoPE(visOffset: visOffset, llmH: llmH, llmW: llmW)
 
-        // Initialize state
-        let n = tokens.count
+        // Check System-Prompt KV Prefix Cache
+        let prefixHit: Bool
+        if usePrefixCache && visOffset > 0 {
+            let prefix = Array(tokens[0..<visOffset])
+            if cachedPrefixTokens == prefix {
+                prefixHit = true
+            } else {
+                cachedPrefixTokens = prefix
+                prefixHit = false
+            }
+        } else {
+            prefixHit = false
+        }
+
+        let startPos = prefixHit ? visOffset : 0
+        let activeTokens = prefixHit ? (tokens.count - visOffset) : tokens.count
+        let activeVisOffset = prefixHit ? 0 : visOffset
+
         let pt = promptToks.contents().assumingMemoryBound(to: Int32.self)
-        for i in 0..<n { pt[i] = tokens[i] }
+        for i in 0..<activeTokens { pt[i] = tokens[startPos + i] }
 
         let s = state.contents().assumingMemoryBound(to: Int32.self)
-        s[0] = 0 // pos
-        s[1] = Int32(n) // n
+        s[0] = Int32(startPos) // pos
+        s[1] = Int32(activeTokens) // n
         s[2] = 0 // step
         s[3] = 0 // done
         s[4] = Int32(maxContext)
         s[5] = Int32(min(maxNewTokens, maxSteps))
         s[6] = eos.0
         s[7] = eos.1
-        s[8] = Int32(visOffset)
+        s[8] = Int32(activeVisOffset)
         s[9] = Int32(nVis)
         s[10] = Int32(max(llmH, llmW) - nVis)
         s[11] = Int32(np)
 
-        // 1. Vision command buffer
-        let (cbVis, eVis) = newEncoder()
-        encodeVision(eVis, gridH: gridH, gridW: gridW, patchifyFromRGB: true)
-        eVis.endEncoding()
-        cbVis.commit()
+        // 1. Vision command buffer (skipped on identical consecutive screen frame)
+        var cbVisOpt: MTLCommandBuffer? = nil
+        if !skipVision {
+            let (cbVis, eVis) = newEncoder()
+            encodeVision(eVis, gridH: gridH, gridW: gridW, patchifyFromRGB: true)
+            eVis.endEncoding()
+            cbVis.commit()
+            cbVisOpt = cbVis
+        }
 
         // 2. Prefill command buffer
         let (cbPre, ePre) = newEncoder()
-        encodePrefill(ePre, n: n, hasVis: visOffset >= 0, nVis: nVis, writeLogits: writeFirstLogits)
+        encodePrefill(ePre, n: activeTokens, hasVis: visOffset >= 0, nVis: nVis, writeLogits: writeFirstLogits)
         ePre.endEncoding()
         cbPre.commit()
 
@@ -741,12 +784,12 @@ public final class Engine {
             if s[3] != 0 { break }
         }
 
-        cbVis.waitUntilCompleted()
+        cbVisOpt?.waitUntilCompleted()
         cbPre.waitUntilCompleted()
         for cb in decodeCBs { cb.waitUntilCompleted() }
 
         let tEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let visMs = (cbVis.gpuEndTime - cbVis.gpuStartTime) * 1e3
+        let visMs = cbVisOpt.map { ($0.gpuEndTime - $0.gpuStartTime) * 1e3 } ?? 0.0
         let preMs = (cbPre.gpuEndTime - cbPre.gpuStartTime) * 1e3
         var decMs = 0.0
         for cb in decodeCBs {
@@ -770,7 +813,7 @@ public final class Engine {
             prefillMs: preMs,
             decodeMs: decMs,
             totalMs: Double(tEnd - t0) / 1e6,
-            prefillTokens: n,
+            prefillTokens: activeTokens,
             generatedTokens: result.count
         )
         return result
