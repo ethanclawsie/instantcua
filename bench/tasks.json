@@ -118,5 +118,245 @@
       981,
       234
     ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "11_menubar_view",
+    "image" : "bench\/images\/11_menubar_view.png",
+    "prompt" : "Click 'View' in the top macOS menu bar.",
+    "targetBox1000" : [
+      226,
+      0,
+      331,
+      78
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "12_dock_terminal",
+    "image" : "bench\/images\/12_dock_terminal.png",
+    "prompt" : "Click the 'Terminal' icon in the bottom Dock.",
+    "targetBox1000" : [
+      435,
+      818,
+      553,
+      984
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "13_browser_new_tab",
+    "image" : "bench\/images\/13_browser_new_tab.png",
+    "prompt" : "Click the '+' button next to the 'GitHub' tab to open a new browser tab.",
+    "targetBox1000" : [
+      523,
+      100,
+      596,
+      192
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "14_checkbox_remember",
+    "image" : "bench\/images\/14_checkbox_remember.png",
+    "prompt" : "Click the checkbox next to 'Remember window position'.",
+    "targetBox1000" : [
+      212,
+      464,
+      554,
+      551
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "15_radio_export_png",
+    "image" : "bench\/images\/15_radio_export_png.png",
+    "prompt" : "Click the 'PNG Image' option.",
+    "targetBox1000" : [
+      243,
+      472,
+      492,
+      559
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "16_segmented_week",
+    "image" : "bench\/images\/16_segmented_week.png",
+    "prompt" : "Click 'Week' in the segmented control bar.",
+    "targetBox1000" : [
+      385,
+      219,
+      515,
+      333
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "17_slider_volume_knob",
+    "image" : "bench\/images\/17_slider_volume_knob.png",
+    "prompt" : "Click the white circular slider knob on the 'Output Volume' slider.",
+    "targetBox1000" : [
+      557,
+      389,
+      631,
+      492
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "18_dropdown_resolution",
+    "image" : "bench\/images\/18_dropdown_resolution.png",
+    "prompt" : "Click the '2560 x 1440 (Default)' dropdown menu.",
+    "targetBox1000" : [
+      407,
+      292,
+      812,
+      406
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "19_table_row_edit",
+    "image" : "bench\/images\/19_table_row_edit.png",
+    "prompt" : "Click the blue 'Edit' button in the row for 'charlie@team.io'.",
+    "targetBox1000" : [
+      727,
+      521,
+      860,
+      624
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "20_ide_run_button",
+    "image" : "bench\/images\/20_ide_run_button.png",
+    "prompt" : "Click the green 'Run' button in the top-right toolbar.",
+    "targetBox1000" : [
+      688,
+      94,
+      824,
+      187
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "21_context_menu_duplicate",
+    "image" : "bench\/images\/21_context_menu_duplicate.png",
+    "prompt" : "Click 'Duplicate' in the context menu.",
+    "targetBox1000" : [
+      369,
+      433,
+      646,
+      536
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "22_mail_compose",
+    "image" : "bench\/images\/22_mail_compose.png",
+    "prompt" : "Click the blue 'Compose' button in the toolbar.",
+    "targetBox1000" : [
+      204,
+      199,
+      362,
+      307
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "23_wifi_connect",
+    "image" : "bench\/images\/23_wifi_connect.png",
+    "prompt" : "Click the 'Join' button next to 'Corp-Guest'.",
+    "targetBox1000" : [
+      657,
+      430,
+      796,
+      533
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "24_pagination_next",
+    "image" : "bench\/images\/24_pagination_next.png",
+    "prompt" : "Click the 'Next >' button at the bottom right.",
+    "targetBox1000" : [
+      723,
+      761,
+      868,
+      874
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "25_modal_close_x",
+    "image" : "bench\/images\/25_modal_close_x.png",
+    "prompt" : "Click the red 'X' button in the top-right corner of the 'Subscription Details' modal.",
+    "targetBox1000" : [
+      698,
+      238,
+      774,
+      346
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "26_terminal_split_tab",
+    "image" : "bench\/images\/26_terminal_split_tab.png",
+    "prompt" : "Click the 'ssh prod-01' terminal tab.",
+    "targetBox1000" : [
+      485,
+      178,
+      953,
+      281
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "27_color_swatch_orange",
+    "image" : "bench\/images\/27_color_swatch_orange.png",
+    "prompt" : "Click the orange square color swatch (second from the left).",
+    "targetBox1000" : [
+      326,
+      415,
+      434,
+      575
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "28_minimize_window",
+    "image" : "bench\/images\/28_minimize_window.png",
+    "prompt" : "Click the yellow minimize button in the top-left corner of the window.",
+    "targetBox1000" : [
+      138,
+      136,
+      206,
+      229
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "29_git_commit_push",
+    "image" : "bench\/images\/29_git_commit_push.png",
+    "prompt" : "Click the blue 'Commit & Push' button in the left panel.",
+    "targetBox1000" : [
+      57,
+      480,
+      349,
+      604
+    ]
+  },
+  {
+    "expectedAction" : "click",
+    "id" : "30_permission_allow",
+    "image" : "bench\/images\/30_permission_allow.png",
+    "prompt" : "Click the 'Open System Settings' button.",
+    "targetBox1000" : [
+      438,
+      597,
+      788,
+      721
+    ]
   }
 ]
