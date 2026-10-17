@@ -15,7 +15,7 @@ public final class Engine {
     let wbuf: MTLBuffer
 
     // Vision buffers
-    let rgbBuf, patchBuf, vx, vxn, vq, vk, vv, vattn, vhbuf: MTLBuffer
+    let rgbBuf, patchBuf, vx, vxn, vq, vk, vv, vattn, vhbuf, vscores, vprobs: MTLBuffer
     let vPosInterp, vRope: MTLBuffer
     public let poolerBuf: MTLBuffer
     public let deepstackBufs: [MTLBuffer]
@@ -80,11 +80,13 @@ public final class Engine {
         patchBuf = buf(maxPatches * Dims.vitPatchDim * 4)
         vx = buf(maxPatches * Dims.vitHidden * 4)
         vxn = buf(maxPatches * Dims.vitHidden * 4)
-        vq = buf(maxPatches * Dims.vitHidden * 4)
-        vk = buf(maxPatches * Dims.vitHidden * 4)
-        vv = buf(maxPatches * Dims.vitHidden * 4)
-        vattn = buf(maxPatches * Dims.vitHidden * 4)
-        vhbuf = buf(maxPatches * Dims.vitFF * 4)
+        vq = buf(maxPatches * Dims.vitHidden * 2)
+        vk = buf(maxPatches * Dims.vitHidden * 2)
+        vv = buf(maxPatches * Dims.vitHidden * 2)
+        vattn = buf(maxPatches * Dims.vitHidden * 2)
+        vhbuf = buf(maxPatches * Dims.vitFF * 2)
+        vscores = buf(Dims.vitHeads * maxPatches * maxPatches * 4)
+        vprobs = buf(Dims.vitHeads * maxPatches * maxPatches * 2)
         vPosInterp = buf(maxPatches * Dims.vitHidden * 4)
         vRope = buf(maxPatches * 32 * 8)
         poolerBuf = buf(maxVis * Dims.hidden * 4)
@@ -116,7 +118,7 @@ public final class Engine {
         rd.initialCapacity = 32
         if pinMemory, let rs = try? dev.makeResidencySet(descriptor: rd) {
             var allBufs: [MTLBuffer] = [
-                wbuf, rgbBuf, patchBuf, vx, vxn, vq, vk, vv, vattn, vhbuf, vPosInterp, vRope, poolerBuf,
+                wbuf, rgbBuf, patchBuf, vx, vxn, vq, vk, vv, vattn, vhbuf, vscores, vprobs, vPosInterp, vRope, poolerBuf,
                 x, q, attn, hbuf, kc, vc, state, promptToks, outToks, pval, pidx, logits, rope,
             ]
             allBufs.append(contentsOf: deepstackBufs)
@@ -343,14 +345,16 @@ public final class Engine {
             e.setBytes(&np, length: 4, index: 7)
             grid(e, 48, npTiles, 128)
 
-            // Bidirectional full attention -> fp16 vattn
+            // Bidirectional full attention on Neural Accelerators -> fp16 vattn
             e.setComputePipelineState(pVitAttn)
             e.setBuffer(vq, offset: 0, index: 0)
             e.setBuffer(vk, offset: 0, index: 1)
             e.setBuffer(vv, offset: 0, index: 2)
             e.setBuffer(vattn, offset: 0, index: 3)
-            e.setBytes(&np, length: 4, index: 4)
-            grid(e, Dims.vitHeads, Int(np), 256)
+            e.setBuffer(vscores, offset: 0, index: 4)
+            e.setBuffer(vprobs, offset: 0, index: 5)
+            e.setBytes(&np, length: 4, index: 6)
+            grid(e, Dims.vitHeads, Int(np) / 16, 128)
 
             // Output projection + residual on Neural Accelerators (MODE 1: outf += X @ W^T + bias)
             e.setComputePipelineState(pVitProj)

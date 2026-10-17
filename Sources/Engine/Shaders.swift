@@ -235,65 +235,95 @@ kernel void k_vit_qkv(device half* X [[buffer(0)]],
     }
 }
 
-// ViT bidirectional full attention across np patches (head-major fp16 vq, vk, vv [16, np, 64] -> fp16 out [np, 1024]).
-// Grid (16, np), 256 threads.
-kernel void k_vit_attn(device const half* vq [[buffer(0)]],
-                       device const half* vk [[buffer(1)]],
-                       device const half* vv [[buffer(2)]],
+// ViT bidirectional full attention on M5 Neural Accelerators (matmul2d Q @ K^T + softmax + matmul2d P @ V).
+// Each threadgroup computes 1 head (h = 0..15) and TT = 16 query patches (t0 = tgp.y * 16).
+// Uses L2-resident device buffers vscores [16, np, np] (float) and vprobs [16, np, np] (half),
+// and 16 KiB of threadgroup memory Os [4 * 16 * 64] for the PV split-K reduction.
+// Grid (16, np / 16) = (16, 60), 128 threads (4 simdgroups).
+kernel void k_vit_attn(device half* vq [[buffer(0)]],
+                       device half* vk [[buffer(1)]],
+                       device half* vv [[buffer(2)]],
                        device half* out [[buffer(3)]],
-                       constant int& np [[buffer(4)]],
+                       device float* vscores [[buffer(4)]],
+                       device half* vprobs [[buffer(5)]],
+                       constant int& np [[buffer(6)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]],
                        uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int TT = 16;
     const int h = tgp.x;
-    const int p = tgp.y;
-    if (p >= np) return;
-    threadgroup float qs[VHD];
-    threadgroup float sc[NPATCH_MAX];
-    threadgroup float red[8];
-    threadgroup float part[256];
-    device const half* Qh = vq + (ulong)h * np * VHD;
-    device const half* Kh = vk + (ulong)h * np * VHD;
-    device const half* Vh = vv + (ulong)h * np * VHD;
-    if (tid < VHD) qs[tid] = float(Qh[p * VHD + tid]) * 0.125f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const threadgroup float4* qs4 = (const threadgroup float4*)qs;
-    float m = -INFINITY;
-    for (int s = tid; s < np; s += 256) {
-        device const half4* kr = (device const half4*)(Kh + s * VHD);
-        float a = 0.f;
-        for (int j = 0; j < 16; ++j) a += dot(float4(kr[j]), qs4[j]);
-        sc[s] = a;
-        m = max(m, a);
+    const int t0 = tgp.y * TT;
+    if (t0 >= np) return;
+
+    device half* Qh = vq + ((ulong)h * np + t0) * VHD;
+    device half* Kh = vk + (ulong)h * np * VHD;
+    device half* Vh = vv + (ulong)h * np * VHD;
+    device float* Sh = vscores + ((ulong)h * np + t0) * np;
+    device half* Ph = vprobs + ((ulong)h * np + t0) * np;
+
+    // Phase 1: Q_tile [16, 64] @ K_h^T [960, 64] -> Sh [16, 960] via Neural Accelerators
+    auto tQ = tensor(Qh, dextents<int, 2>(VHD, TT), array<int, 2>({1, VHD}));
+    constexpr auto descQK = matmul2d_descriptor(TT, 32, VHD, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descQK, execution_simdgroup> opQK;
+    const int nKeyTiles = np / 32; // 30
+    for (int kt = sg; kt < nKeyTiles; kt += 4) {
+        const int s0 = kt * 32;
+        auto tK = tensor(Kh + (ulong)s0 * VHD, dextents<int, 2>(VHD, 32), array<int, 2>({1, VHD}));
+        auto cS = opQK.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK), float>();
+        for (int i = 0; i < cS.get_capacity(); i++) if (cS.is_valid_element(i)) cS[i] = 0.f;
+        opQK.run(tQ, tK, cS);
+        auto tS = tensor(Sh + s0, dextents<int, 2>(32, TT), array<int, 2>({1, np}));
+        cS.store(tS);
     }
-    m = simd_max(m);
-    if (lane == 0) red[sg] = m;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    m = red[0];
-    for (int i = 1; i < 8; ++i) m = max(m, red[i]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float sum = 0.f;
-    for (int s = tid; s < np; s += 256) {
-        const float e = exp(sc[s] - m);
-        sc[s] = e;
-        sum += e;
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 2: Row-wise softmax over 960 keys for each of the 16 query rows (4 rows per simdgroup)
+    for (int r = sg * 4; r < sg * 4 + 4; ++r) {
+        device float* sr = Sh + r * np;
+        device half* pr = Ph + r * np;
+        float m = -INFINITY;
+        for (int s = lane; s < np; s += 32) {
+            const float v = sr[s] * 0.125f;
+            sr[s] = v;
+            m = max(m, v);
+        }
+        m = simd_max(m);
+        float sum = 0.f;
+        for (int s = lane; s < np; s += 32) {
+            const float e = exp(sr[s] - m);
+            sr[s] = e;
+            sum += e;
+        }
+        const float inv_sum = 1.0f / simd_sum(sum);
+        for (int s = lane; s < np; s += 32) {
+            pr[s] = half(sr[s] * inv_sum);
+        }
     }
-    sum = simd_sum(sum);
-    if (lane == 0) red[sg] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    sum = 0.f;
-    for (int i = 0; i < 8; ++i) sum += red[i];
-    const int d = tid & 63;
-    const int q = tid >> 6;
-    float o = 0.f;
-    for (int s = q; s < np; s += 4) {
-        o += sc[s] * float(Vh[s * VHD + d]);
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Phase 3: Ph [16, 960] @ V_h [960, 64] -> O [16, 64] via Neural Accelerators
+    threadgroup float Os[4 * TT * VHD]; // 16 KiB
+    auto tP = tensor(Ph, dextents<int, 2>(np, TT), array<int, 2>({1, np}));
+    auto tV = tensor(Vh, dextents<int, 2>(VHD, np), array<int, 2>({1, VHD}));
+    constexpr auto descPV = matmul2d_descriptor(TT, VHD, 32, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descPV, execution_simdgroup> opPV;
+    auto cO = opPV.template get_destination_cooperative_tensor<decltype(tP.template slice<32, TT>(0, 0)), decltype(tV.template slice<VHD, 32>(0, 0)), float>();
+    for (int i = 0; i < cO.get_capacity(); i++) if (cO.is_valid_element(i)) cO[i] = 0.f;
+    for (int kt = sg; kt < nKeyTiles; kt += 4) {
+        const int s0 = kt * 32;
+        auto a = tP.template slice<32, TT>(s0, 0);
+        auto b = tV.template slice<VHD, 32>(0, s0);
+        opPV.run(a, b, cO);
     }
-    part[tid] = o;
+    auto tO = tensor(Os + sg * TT * VHD, dextents<int, 2>(VHD, TT), array<int, 2>({1, VHD}));
+    cO.store(tO);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < VHD) {
-        out[p * VH + h * VHD + tid] = half((part[tid] + part[tid + 64] + part[tid + 128] + part[tid + 192]) / sum);
+
+    for (int w = tid; w < TT * VHD; w += 128) {
+        const int t = w / VHD, d = w % VHD;
+        const float val = Os[0 * TT * VHD + w] + Os[1 * TT * VHD + w] + Os[2 * TT * VHD + w] + Os[3 * TT * VHD + w];
+        out[(ulong)(t0 + t) * VH + h * VHD + d] = half(val);
     }
 }
 
