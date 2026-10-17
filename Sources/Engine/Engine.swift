@@ -292,11 +292,14 @@ public final class Engine {
         return (cb, e)
     }
 
-    // Encodes the full 24-block Vision Transformer + 3 DeepStack mergers + 1 final merger into command encoder `e`.
+    // Encodes the full 24-block Vision Transformer + 3 DeepStack mergers + 1 final merger into command encoder `e`
+    // using the Apple M5 Neural Accelerators (MetalPerformancePrimitives matmul2d).
     public func encodeVision(_ e: MTLComputeCommandEncoder, gridH: Int = 24, gridW: Int = 40, patchifyFromRGB: Bool = true) {
         prepareVisionGrid(gridH: gridH, gridW: gridW)
         var np = Int32(gridH * gridW)
         var nVis = Int32(np / 4)
+        let npTiles = Int(np) / 32
+        let visTiles = Int(nVis) / 16
 
         if patchifyFromRGB {
             var ghw = SIMD2<Int32>(Int32(gridH), Int32(gridW))
@@ -307,19 +310,19 @@ public final class Engine {
             grid(e, Int(np), 1, 256)
         }
 
-        // Patch embedding + bilinear pos_embed
+        // Patch embedding + bilinear pos_embed on Neural Accelerators (MODE 4: outf = X @ W^T + bias + pos_interp)
         e.setComputePipelineState(pVitPatchEmbed)
         e.setBuffer(patchBuf, offset: 0, index: 0)
         w(e, TensorID.vitPatchW, 1)
         w(e, TensorID.vitPatchB, 2)
-        e.setBuffer(vPosInterp, offset: 0, index: 3)
-        e.setBuffer(vx, offset: 0, index: 4)
-        e.setBytes(&np, length: 4, index: 5)
-        grid(e, Dims.vitHidden / 8, Int(np), 256)
+        e.setBuffer(vx, offset: 0, index: 3)
+        e.setBuffer(vxn, offset: 0, index: 4)
+        e.setBuffer(vPosInterp, offset: 0, index: 5)
+        grid(e, Dims.vitHidden / 32, npTiles, 128)
 
         // 24 Vision Transformer blocks
         for l in 0..<Dims.vitLayers {
-            // norm1
+            // norm1 -> fp16 vxn
             e.setComputePipelineState(pVitLN1024)
             e.setBuffer(vx, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vNorm1W), 1)
@@ -328,7 +331,7 @@ public final class Engine {
             e.setBytes(&np, length: 4, index: 4)
             grid(e, Int(np), 1, 256)
 
-            // QKV + 2D Vision RoPE
+            // QKV + 2D Vision RoPE on Neural Accelerators -> head-major fp16 vq, vk, vv
             e.setComputePipelineState(pVitQkv)
             e.setBuffer(vxn, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vQkvW), 1)
@@ -338,9 +341,9 @@ public final class Engine {
             e.setBuffer(vk, offset: 0, index: 5)
             e.setBuffer(vv, offset: 0, index: 6)
             e.setBytes(&np, length: 4, index: 7)
-            grid(e, 48, Int(np), 256)
+            grid(e, 48, npTiles, 128)
 
-            // Bidirectional full attention
+            // Bidirectional full attention -> fp16 vattn
             e.setComputePipelineState(pVitAttn)
             e.setBuffer(vq, offset: 0, index: 0)
             e.setBuffer(vk, offset: 0, index: 1)
@@ -349,16 +352,17 @@ public final class Engine {
             e.setBytes(&np, length: 4, index: 4)
             grid(e, Dims.vitHeads, Int(np), 256)
 
-            // Output projection + residual
+            // Output projection + residual on Neural Accelerators (MODE 1: outf += X @ W^T + bias)
             e.setComputePipelineState(pVitProj)
             e.setBuffer(vattn, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vProjW), 1)
             w(e, TensorID.vitLayer(l, TensorID.vProjB), 2)
             e.setBuffer(vx, offset: 0, index: 3)
-            e.setBytes(&np, length: 4, index: 4)
-            grid(e, Dims.vitHidden / 8, Int(np), 256)
+            e.setBuffer(vxn, offset: 0, index: 4)
+            e.setBuffer(vPosInterp, offset: 0, index: 5)
+            grid(e, Dims.vitHidden / 32, npTiles, 128)
 
-            // norm2
+            // norm2 -> fp16 vxn
             e.setComputePipelineState(pVitLN1024)
             e.setBuffer(vx, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vNorm2W), 1)
@@ -367,23 +371,25 @@ public final class Engine {
             e.setBytes(&np, length: 4, index: 4)
             grid(e, Int(np), 1, 256)
 
-            // MLP fc1 (GELU tanh)
+            // MLP fc1 (GELU tanh) on Neural Accelerators (MODE 2: outh = half(gelu_tanh(X @ W^T + bias)))
             e.setComputePipelineState(pVitFc1)
             e.setBuffer(vxn, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vFc1W), 1)
             w(e, TensorID.vitLayer(l, TensorID.vFc1B), 2)
-            e.setBuffer(vhbuf, offset: 0, index: 3)
-            e.setBytes(&np, length: 4, index: 4)
-            grid(e, Dims.vitFF / 8, Int(np), 256)
+            e.setBuffer(vx, offset: 0, index: 3)
+            e.setBuffer(vhbuf, offset: 0, index: 4)
+            e.setBuffer(vPosInterp, offset: 0, index: 5)
+            grid(e, Dims.vitFF / 32, npTiles, 128)
 
-            // MLP fc2 + residual
+            // MLP fc2 + residual on Neural Accelerators (MODE 1: outf += X @ W^T + bias)
             e.setComputePipelineState(pVitFc2)
             e.setBuffer(vhbuf, offset: 0, index: 0)
             w(e, TensorID.vitLayer(l, TensorID.vFc2W), 1)
             w(e, TensorID.vitLayer(l, TensorID.vFc2B), 2)
             e.setBuffer(vx, offset: 0, index: 3)
-            e.setBytes(&np, length: 4, index: 4)
-            grid(e, Dims.vitHidden / 8, Int(np), 256)
+            e.setBuffer(vxn, offset: 0, index: 4)
+            e.setBuffer(vPosInterp, offset: 0, index: 5)
+            grid(e, Dims.vitHidden / 32, npTiles, 128)
 
             // DeepStack mergers at layers 5, 11, 17 (use_postshuffle_norm = True: LN over 4096)
             if let dsIdx = Dims.deepstackLayers.firstIndex(of: l) {
@@ -399,17 +405,19 @@ public final class Engine {
                 e.setBuffer(vxn, offset: 0, index: 0)
                 w(e, TensorID.merger(dsIdx, TensorID.mFc1W), 1)
                 w(e, TensorID.merger(dsIdx, TensorID.mFc1B), 2)
-                e.setBuffer(vhbuf, offset: 0, index: 3)
-                e.setBytes(&nVis, length: 4, index: 4)
-                grid(e, Dims.mergerHidden / 8, Int(nVis), 256)
+                e.setBuffer(vx, offset: 0, index: 3)
+                e.setBuffer(vhbuf, offset: 0, index: 4)
+                e.setBuffer(vPosInterp, offset: 0, index: 5)
+                grid(e, Dims.mergerHidden / 32, visTiles, 128)
 
                 e.setComputePipelineState(pMergerFc2)
                 e.setBuffer(vhbuf, offset: 0, index: 0)
                 w(e, TensorID.merger(dsIdx, TensorID.mFc2W), 1)
                 w(e, TensorID.merger(dsIdx, TensorID.mFc2B), 2)
                 e.setBuffer(deepstackBufs[dsIdx], offset: 0, index: 3)
-                e.setBytes(&nVis, length: 4, index: 4)
-                grid(e, Dims.hidden / 8, Int(nVis), 256)
+                e.setBuffer(vxn, offset: 0, index: 4)
+                e.setBuffer(vPosInterp, offset: 0, index: 5)
+                grid(e, Dims.hidden / 32, visTiles, 128)
             }
         }
 
@@ -427,17 +435,19 @@ public final class Engine {
         e.setBuffer(vxn, offset: 0, index: 0)
         w(e, TensorID.merger(finalIdx, TensorID.mFc1W), 1)
         w(e, TensorID.merger(finalIdx, TensorID.mFc1B), 2)
-        e.setBuffer(vhbuf, offset: 0, index: 3)
-        e.setBytes(&nVis, length: 4, index: 4)
-        grid(e, Dims.mergerHidden / 8, Int(nVis), 256)
+        e.setBuffer(vx, offset: 0, index: 3)
+        e.setBuffer(vhbuf, offset: 0, index: 4)
+        e.setBuffer(vPosInterp, offset: 0, index: 5)
+        grid(e, Dims.mergerHidden / 32, visTiles, 128)
 
         e.setComputePipelineState(pMergerFc2)
         e.setBuffer(vhbuf, offset: 0, index: 0)
         w(e, TensorID.merger(finalIdx, TensorID.mFc2W), 1)
         w(e, TensorID.merger(finalIdx, TensorID.mFc2B), 2)
         e.setBuffer(poolerBuf, offset: 0, index: 3)
-        e.setBytes(&nVis, length: 4, index: 4)
-        grid(e, Dims.hidden / 8, Int(nVis), 256)
+        e.setBuffer(vxn, offset: 0, index: 4)
+        e.setBuffer(vPosInterp, offset: 0, index: 5)
+        grid(e, Dims.hidden / 32, visTiles, 128)
     }
 
     // Encodes one LLM decoder layer `l` for `n` tokens.

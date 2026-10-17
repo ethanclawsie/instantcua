@@ -6,7 +6,10 @@
 
 let shaderSource = #"""
 #include <metal_stdlib>
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace metal;
+using namespace mpp::tensor_ops;
 
 // Vision Encoder dimensions (Qwen3VLVisionModel)
 #define VH 1024
@@ -73,12 +76,12 @@ inline float gelu_exact(float x) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Vision Encoder kernels (weights in fp16, norms/biases in fp32)
+// Vision Encoder kernels on M5 Neural Accelerators (MPP matmul2d, weights in fp16)
 
-// Patchify RGB8 image [H_img, W_img, 3] into merge-ordered patches [npatches, 768].
+// Patchify RGB8 image [H_img, W_img, 3] into merge-ordered fp16 patches [npatches, 768].
 // Grid (npatches), 256 threads.
 kernel void k_vit_patchify_rgb(device const uchar* rgb [[buffer(0)]],
-                               device float* patches [[buffer(1)]],
+                               device half* patches [[buffer(1)]],
                                constant int2& grid_hw [[buffer(2)]], // (grid_h, grid_w) in 16x16 patches
                                uint p [[threadgroup_position_in_grid]],
                                uint tid [[thread_index_in_threadgroup]]) {
@@ -103,48 +106,22 @@ kernel void k_vit_patchify_rgb(device const uchar* rgb [[buffer(0)]],
         const int y = pr * 16 + dy;
         const int x = pc * 16 + dx;
         const uchar val = rgb[(y * img_w + x) * 3 + c];
-        patches[p * VPATCH + i] = float(val) * (2.0f / 255.0f) - 1.0f;
+        patches[p * VPATCH + i] = half(float(val) * (2.0f / 255.0f) - 1.0f);
     }
 }
 
-// Patch embed + bilinear pos_embed addition: patches [np, 768] -> x [np, 1024].
-// Grid (VH / 8, np) = (128, np), 256 threads (8 simdgroups, 1 row per simdgroup).
-kernel void k_vit_patch_embed(device const float* patches [[buffer(0)]],
-                              device const half* W [[buffer(1)]],
-                              device const float* bias [[buffer(2)]],
-                              device const float* pos_interp [[buffer(3)]],
-                              device float* x [[buffer(4)]],
-                              constant int& np [[buffer(5)]],
-                              uint2 tgp [[threadgroup_position_in_grid]],
-                              ushort lane [[thread_index_in_simdgroup]],
-                              ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const int p = tgp.y;
-    if (p >= np) return;
-    const int row = tgp.x * 8 + sg;
-    device const float4* xp = (device const float4*)(patches + p * VPATCH);
-    device const half4* wp = (device const half4*)(W + row * VPATCH);
-    float acc = 0.f;
-    for (int c = lane; c < VPATCH / 4; c += 32) {
-        acc += dot(float4(wp[c]), xp[c]);
-    }
-    acc = simd_sum(acc);
-    if (lane == 0) {
-        x[p * VH + row] = acc + bias[row] + pos_interp[p * VH + row];
-    }
-}
-
-// Standard LayerNorm over D columns (D = 1024 for ViT blocks/final merger, D = 4096 for DeepStack).
+// Standard LayerNorm over D columns outputting fp16 for Neural Accelerator GEMM consumption.
 // Grid (nrows), 256 threads.
 template<int D>
-kernel void k_layernorm_T(device const float* x [[buffer(0)]],
-                          device const float* w [[buffer(1)]],
-                          device const float* b [[buffer(2)]],
-                          device float* out [[buffer(3)]],
-                          constant int& nrows [[buffer(4)]],
-                          uint r [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]],
-                          uint sg [[simdgroup_index_in_threadgroup]]) {
+kernel void k_layernorm_h_T(device const float* x [[buffer(0)]],
+                            device const float* w [[buffer(1)]],
+                            device const float* b [[buffer(2)]],
+                            device half* out [[buffer(3)]],
+                            constant int& nrows [[buffer(4)]],
+                            uint r [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]]) {
     if ((int)r >= nrows) return;
     threadgroup float red_m[8];
     threadgroup float red_v[8];
@@ -164,73 +141,106 @@ kernel void k_layernorm_T(device const float* x [[buffer(0)]],
     if (lane == 0) red_v[sg] = vsum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float inv_std = rsqrt((red_v[0] + red_v[1] + red_v[2] + red_v[3] + red_v[4] + red_v[5] + red_v[6] + red_v[7]) / float(D) + EPS);
-    device float* yr = out + r * D;
+    device half* yr = out + r * D;
     for (int i = tid; i < D; i += 256) {
-        yr[i] = (xr[i] - mean) * inv_std * w[i] + b[i];
+        yr[i] = half((xr[i] - mean) * inv_std * w[i] + b[i]);
     }
 }
 
-template [[host_name("k_vit_ln1024")]] kernel void k_layernorm_T<1024>(device const float*, device const float*, device const float*, device float*, constant int&, uint, uint, uint, uint);
-template [[host_name("k_vit_ln4096")]] kernel void k_layernorm_T<4096>(device const float*, device const float*, device const float*, device float*, constant int&, uint, uint, uint, uint);
+template [[host_name("k_vit_ln1024")]] kernel void k_layernorm_h_T<1024>(device const float*, device const float*, device const float*, device half*, constant int&, uint, uint, uint, uint);
+template [[host_name("k_vit_ln4096")]] kernel void k_layernorm_h_T<4096>(device const float*, device const float*, device const float*, device half*, constant int&, uint, uint, uint, uint);
 
-// ViT QKV projection + 2D Vision RoPE: xn [np, 1024] -> vq [np, 1024], vk [np, 1024], vv [np, 1024].
-// W_qkv is [3072, 1024] where 0..1023 = Q, 1024..2047 = K, 2048..3071 = V.
-// Each threadgroup computes one 64-dim head of Q, K, or V (48 heads total = 16 Q + 16 K + 16 V).
-// Grid (48, np), 256 threads (8 simdgroups, 8 rows per simdgroup).
-kernel void k_vit_qkv(device const float* xn [[buffer(0)]],
-                      device const half* W [[buffer(1)]],
+// M5 Neural Accelerator (matmul2d) ViT QKV projection + 2D Vision RoPE:
+// Each threadgroup computes one 64-dim head (h_all = 0..47) across TT = 32 patches,
+// applies 2D Vision RoPE to Q and K, and writes head-major fp16 vq, vk, vv [16, np, 64].
+// Grid (48, np / 32), 128 threads (4 simdgroups splitting K = 1024 in steps of BK = 64).
+kernel void k_vit_qkv(device half* X [[buffer(0)]],
+                      device half* W [[buffer(1)]],
                       device const float* bias [[buffer(2)]],
                       device const float2* vrope [[buffer(3)]],
-                      device float* vq [[buffer(4)]],
-                      device float* vk [[buffer(5)]],
-                      device float* vv [[buffer(6)]],
+                      device half* vq [[buffer(4)]],
+                      device half* vk [[buffer(5)]],
+                      device half* vv [[buffer(6)]],
                       constant int& np [[buffer(7)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
                       uint tid [[thread_index_in_threadgroup]],
-                      ushort lane [[thread_index_in_simdgroup]],
-                      ushort sg [[simdgroup_index_in_threadgroup]]) {
+                      uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int TT = 32;
+    constexpr int BK = 64;
+    constexpr int NS = 4;
+    constexpr int NSTEP = VH / BK / NS; // 1024 / 64 / 4 = 4
     const int h_all = tgp.x; // 0..47
-    const int p = tgp.y;
-    if (p >= np) return;
-    threadgroup float hv[64];
-    const int r0 = h_all * 64 + sg * 8;
-    device const float4* xp = (device const float4*)(xn + p * VH);
-    for (int r = 0; r < 8; ++r) {
-        device const half4* wp = (device const half4*)(W + (ulong)(r0 + r) * VH);
-        float acc = 0.f;
-        for (int c = lane; c < VH / 4; c += 32) acc += dot(float4(wp[c]), xp[c]);
-        acc = simd_sum(acc);
-        if (lane == 0) hv[sg * 8 + r] = acc + bias[r0 + r];
+    const int t0 = tgp.y * TT;
+    if (t0 >= np) return;
+
+    const uint r0 = h_all * 64;
+    threadgroup float Os0[NS * TT * 32];
+    threadgroup float Os1[NS * TT * 32];
+
+    auto tX = tensor(X + (ulong)t0 * VH, dextents<int, 2>(VH, TT), array<int, 2>({1, VH}));
+    auto tW0 = tensor(W + (ulong)r0 * VH, dextents<int, 2>(VH, 32), array<int, 2>({1, VH}));
+    auto tW1 = tensor(W + (ulong)(r0 + 32) * VH, dextents<int, 2>(VH, 32), array<int, 2>({1, VH}));
+    constexpr auto desc = matmul2d_descriptor(TT, 32, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto cT0 = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW0), float>();
+    auto cT1 = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW1), float>();
+    for (int i = 0; i < cT0.get_capacity(); i++) if (cT0.is_valid_element(i)) cT0[i] = 0.f;
+    for (int i = 0; i < cT1.get_capacity(); i++) if (cT1.is_valid_element(i)) cT1[i] = 0.f;
+
+    for (int i = 0; i < NSTEP; i++) {
+        const uint k0 = (sg * NSTEP + i) * BK;
+        auto a = tX.template slice<BK, TT>(k0, 0);
+        auto b0 = tW0.template slice<BK, 32>(k0, 0);
+        auto b1 = tW1.template slice<BK, 32>(k0, 0);
+        op.run(a, b0, cT0);
+        op.run(a, b1, cT1);
     }
+
+    auto tO0 = tensor(Os0 + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
+    auto tO1 = tensor(Os1 + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
+    cT0.store(tO0);
+    cT1.store(tO1);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < 32) {
-        float a = hv[tid], b = hv[tid + 32];
+
+    for (int w = tid; w < TT * 32; w += 128) {
+        const int t = w / 32, d = w % 32;
+        const int p = t0 + t;
+        if (p >= np) continue;
+        float a = bias[r0 + d], b = bias[r0 + 32 + d];
+        for (int q = 0; q < NS; ++q) {
+            a += Os0[q * TT * 32 + w];
+            b += Os1[q * TT * 32 + w];
+        }
         if (h_all < 32) {
-            const float2 cs = vrope[p * 32 + tid];
+            const float2 cs = vrope[p * 32 + d];
             const float a2 = a * cs.x - b * cs.y;
             const float b2 = b * cs.x + a * cs.y;
             a = a2; b = b2;
         }
         if (h_all < 16) {
-            vq[p * VH + h_all * VHD + tid] = a;
-            vq[p * VH + h_all * VHD + tid + 32] = b;
+            device half* qdst = vq + ((ulong)h_all * np + p) * VHD;
+            qdst[d] = half(a);
+            qdst[d + 32] = half(b);
         } else if (h_all < 32) {
             const int kh = h_all - 16;
-            vk[p * VH + kh * VHD + tid] = a;
-            vk[p * VH + kh * VHD + tid + 32] = b;
+            device half* kdst = vk + ((ulong)kh * np + p) * VHD;
+            kdst[d] = half(a);
+            kdst[d + 32] = half(b);
         } else {
             const int vh = h_all - 32;
-            vv[p * VH + vh * VHD + tid] = a;
-            vv[p * VH + vh * VHD + tid + 32] = b;
+            device half* vdst = vv + ((ulong)vh * np + p) * VHD;
+            vdst[d] = half(a);
+            vdst[d + 32] = half(b);
         }
     }
 }
 
-// ViT bidirectional full attention across np patches: Grid (16, np), 256 threads.
-kernel void k_vit_attn(device const float* vq [[buffer(0)]],
-                       device const float* vk [[buffer(1)]],
-                       device const float* vv [[buffer(2)]],
-                       device float* out [[buffer(3)]],
+// ViT bidirectional full attention across np patches (head-major fp16 vq, vk, vv [16, np, 64] -> fp16 out [np, 1024]).
+// Grid (16, np), 256 threads.
+kernel void k_vit_attn(device const half* vq [[buffer(0)]],
+                       device const half* vk [[buffer(1)]],
+                       device const half* vv [[buffer(2)]],
+                       device half* out [[buffer(3)]],
                        constant int& np [[buffer(4)]],
                        uint2 tgp [[threadgroup_position_in_grid]],
                        uint tid [[thread_index_in_threadgroup]],
@@ -243,14 +253,17 @@ kernel void k_vit_attn(device const float* vq [[buffer(0)]],
     threadgroup float sc[NPATCH_MAX];
     threadgroup float red[8];
     threadgroup float part[256];
-    if (tid < VHD) qs[tid] = vq[p * VH + h * VHD + tid] * 0.125f;
+    device const half* Qh = vq + (ulong)h * np * VHD;
+    device const half* Kh = vk + (ulong)h * np * VHD;
+    device const half* Vh = vv + (ulong)h * np * VHD;
+    if (tid < VHD) qs[tid] = float(Qh[p * VHD + tid]) * 0.125f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const threadgroup float4* qs4 = (const threadgroup float4*)qs;
     float m = -INFINITY;
     for (int s = tid; s < np; s += 256) {
-        device const float4* kr = (device const float4*)(vk + s * VH + h * VHD);
+        device const half4* kr = (device const half4*)(Kh + s * VHD);
         float a = 0.f;
-        for (int j = 0; j < 16; ++j) a += dot(kr[j], qs4[j]);
+        for (int j = 0; j < 16; ++j) a += dot(float4(kr[j]), qs4[j]);
         sc[s] = a;
         m = max(m, a);
     }
@@ -275,55 +288,76 @@ kernel void k_vit_attn(device const float* vq [[buffer(0)]],
     const int q = tid >> 6;
     float o = 0.f;
     for (int s = q; s < np; s += 4) {
-        o += sc[s] * vv[s * VH + h * VHD + d];
+        o += sc[s] * float(Vh[s * VHD + d]);
     }
     part[tid] = o;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < VHD) {
-        out[p * VH + h * VHD + tid] = (part[tid] + part[tid + 64] + part[tid + 128] + part[tid + 192]) / sum;
+        out[p * VH + h * VHD + tid] = half((part[tid] + part[tid + 64] + part[tid + 128] + part[tid + 192]) / sum);
     }
 }
 
-// Generic fp16 linear kernel for ViT & Mergers:
-// MODE 0: out[p, r] = dot(W[r], x[p]) + bias[r] (overwrite)
-// MODE 1: out[p, r] += dot(W[r], x[p]) + bias[r] (residual add)
-// MODE 2: out[p, r] = gelu_tanh(dot(W[r], x[p]) + bias[r]) (ViT MLP fc1)
-// MODE 3: out[p, r] = gelu_exact(dot(W[r], x[p]) + bias[r]) (Merger MLP fc1)
-// Grid (ROWS / 8, nrows), 256 threads (8 simdgroups, 1 output row per simdgroup).
-template<int K, int ROWS, int MODE>
-kernel void k_vit_linear_T(device const float* x [[buffer(0)]],
-                           device const half* W [[buffer(1)]],
-                           device const float* bias [[buffer(2)]],
-                           device float* out [[buffer(3)]],
-                           constant int& nrows [[buffer(4)]],
-                           uint2 tgp [[threadgroup_position_in_grid]],
-                           ushort lane [[thread_index_in_simdgroup]],
-                           ushort sg [[simdgroup_index_in_threadgroup]]) {
-    const int p = tgp.y;
-    if (p >= nrows) return;
-    const int row = tgp.x * 8 + sg;
-    if (row >= ROWS) return;
-    device const float4* xp = (device const float4*)(x + (ulong)p * K);
-    device const half4* wp = (device const half4*)(W + (ulong)row * K);
-    float acc = 0.f;
-    for (int c = lane; c < K / 4; c += 32) {
-        acc += dot(float4(wp[c]), xp[c]);
+// Generic M5 Neural Accelerator (matmul2d) fp16 linear kernel for ViT & Mergers:
+// MODE 0: outf[p, r] = dot(W[r], X[p]) + bias[r] (Merger fc2 -> f32)
+// MODE 1: outf[p, r] += dot(W[r], X[p]) + bias[r] (ViT proj & fc2 residual -> f32)
+// MODE 2: outh[p, r] = half(gelu_tanh(dot(W[r], X[p]) + bias[r])) (ViT fc1 -> f16)
+// MODE 3: outh[p, r] = half(gelu_exact(dot(W[r], X[p]) + bias[r])) (Merger fc1 -> f16)
+// MODE 4: outf[p, r] = dot(W[r], X[p]) + bias[r] + pos_interp[p, r] (ViT patch_embed -> f32)
+// Grid (ROWS / 32, nrows / TT), 128 threads (4 simdgroups splitting K in steps of BK = 64).
+template<int K, int ROWS, int MODE, int TT>
+kernel void k_vit_gemm_T(device half* X [[buffer(0)]],
+                         device half* W [[buffer(1)]],
+                         device const float* bias [[buffer(2)]],
+                         device float* outf [[buffer(3)]],
+                         device half* outh [[buffer(4)]],
+                         device const float* pos_interp [[buffer(5)]],
+                         uint2 tgp [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr int NS = 4;
+    constexpr int BK = 64;
+    constexpr int NSTEP = K / BK / NS;
+    const uint r0 = tgp.x * 32;
+    const uint t0 = tgp.y * TT;
+    threadgroup float Os[NS * TT * 32];
+
+    auto tX = tensor(X + (ulong)t0 * K, dextents<int, 2>(K, TT), array<int, 2>({1, K}));
+    auto tW = tensor(W + (ulong)r0 * K, dextents<int, 2>(K, 32), array<int, 2>({1, K}));
+    constexpr auto desc = matmul2d_descriptor(TT, 32, BK, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto cT = op.template get_destination_cooperative_tensor<decltype(tX), decltype(tW), float>();
+    for (int i = 0; i < cT.get_capacity(); i++) if (cT.is_valid_element(i)) cT[i] = 0.f;
+
+    for (int i = 0; i < NSTEP; i++) {
+        const uint k0 = (sg * NSTEP + i) * BK;
+        auto a = tX.template slice<BK, TT>(k0, 0);
+        auto b = tW.template slice<BK, 32>(k0, 0);
+        op.run(a, b, cT);
     }
-    acc = simd_sum(acc);
-    if (lane == 0) {
-        const float v = acc + bias[row];
-        if (MODE == 0) out[(ulong)p * ROWS + row] = v;
-        else if (MODE == 1) out[(ulong)p * ROWS + row] += v;
-        else if (MODE == 2) out[(ulong)p * ROWS + row] = gelu_tanh(v);
-        else if (MODE == 3) out[(ulong)p * ROWS + row] = gelu_exact(v);
+
+    auto tO = tensor(Os + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
+    cT.store(tO);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int w = tid; w < TT * 32; w += 128) {
+        const int t = w / 32, r = w % 32;
+        float v = bias[r0 + r];
+        for (int q = 0; q < NS; ++q) v += Os[q * TT * 32 + w];
+        const ulong idx = (ulong)(t0 + t) * ROWS + r0 + r;
+        if (MODE == 0) outf[idx] = v;
+        else if (MODE == 1) outf[idx] += v;
+        else if (MODE == 2) outh[idx] = half(gelu_tanh(v));
+        else if (MODE == 3) outh[idx] = half(gelu_exact(v));
+        else if (MODE == 4) outf[idx] = v + pos_interp[idx];
     }
 }
 
-template [[host_name("k_vit_proj")]] kernel void k_vit_linear_T<1024, 1024, 1>(device const float*, device const half*, device const float*, device float*, constant int&, uint2, ushort, ushort);
-template [[host_name("k_vit_fc1")]] kernel void k_vit_linear_T<1024, 4096, 2>(device const float*, device const half*, device const float*, device float*, constant int&, uint2, ushort, ushort);
-template [[host_name("k_vit_fc2")]] kernel void k_vit_linear_T<4096, 1024, 1>(device const float*, device const half*, device const float*, device float*, constant int&, uint2, ushort, ushort);
-template [[host_name("k_merger_fc1")]] kernel void k_vit_linear_T<4096, 4096, 3>(device const float*, device const half*, device const float*, device float*, constant int&, uint2, ushort, ushort);
-template [[host_name("k_merger_fc2")]] kernel void k_vit_linear_T<4096, 2048, 0>(device const float*, device const half*, device const float*, device float*, constant int&, uint2, ushort, ushort);
+template [[host_name("k_vit_patch_embed")]] kernel void k_vit_gemm_T<768, 1024, 4, 32>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
+template [[host_name("k_vit_proj")]] kernel void k_vit_gemm_T<1024, 1024, 1, 32>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
+template [[host_name("k_vit_fc1")]] kernel void k_vit_gemm_T<1024, 4096, 2, 32>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
+template [[host_name("k_vit_fc2")]] kernel void k_vit_gemm_T<4096, 1024, 1, 32>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
+template [[host_name("k_merger_fc1")]] kernel void k_vit_gemm_T<4096, 4096, 3, 16>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
+template [[host_name("k_merger_fc2")]] kernel void k_vit_gemm_T<4096, 2048, 0, 16>(device half*, device half*, device const float*, device float*, device half*, device const float*, uint2, uint, uint);
 
 // ---------------------------------------------------------------------------------------------
 // Language Backbone weight format helpers (FMT 0 = f16, FMT 1 = q8 group-32, FMT 2 = q4 group-64)
