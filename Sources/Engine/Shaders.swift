@@ -459,6 +459,75 @@ inline float dot64_row(device const wtype* W, device const half2* SB, uint row, 
 #endif
 }
 
+// Single-weight-read 2-token dot product: loads W[row, c64*64..+63] once and dots against both xh0 and xh1.
+inline float2 dot64_row2(device const wtype* W, device const half2* SB, uint row, uint c64, uint K_cols,
+                         thread const half4* xh0, float X0, thread const half4* xh1, float X1) {
+#if FMT == 0
+    device const half4* wp = (device const half4*)(W + (ulong)row * K_cols + c64 * 64);
+    float acc0 = 0.f, acc1 = 0.f;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 16; ++i) {
+        const float4 w = float4(wp[i]);
+        acc0 += dot(w, float4(xh0[i]));
+        acc1 += dot(w, float4(xh1[i]));
+    }
+    return float2(acc0, acc1);
+#elif FMT == 1
+    device const char4* wp = (device const char4*)(W + (ulong)row * K_cols + c64 * 64);
+    device const half* sp = (device const half*)SB + (ulong)row * (K_cols / 32) + c64 * 2;
+    float d00 = 0.f, d01 = 0.f, d10 = 0.f, d11 = 0.f;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const float4 w0 = float4(wp[i]);
+        const float4 w1 = float4(wp[8 + i]);
+        d00 += dot(w0, float4(xh0[i]));
+        d01 += dot(w1, float4(xh0[8 + i]));
+        d10 += dot(w0, float4(xh1[i]));
+        d11 += dot(w1, float4(xh1[8 + i]));
+    }
+    const float s0 = float(sp[0]), s1 = float(sp[1]);
+    return float2(s0 * d00 + s1 * d01, s0 * d10 + s1 * d11);
+#elif FMT == 2
+    device const uint4* wp = (device const uint4*)(W + (ulong)row * (K_cols / 2) + c64 * 32);
+    const float2 sb = float2(SB[(ulong)row * (K_cols / 64) + c64]);
+    thread const half2* x2_0 = (thread const half2*)xh0;
+    thread const half2* x2_1 = (thread const half2*)xh1;
+    half2 a0 = half2(0.h), b0 = half2(0.h);
+    half2 a1 = half2(0.h), b1 = half2(0.h);
+    #pragma clang loop unroll(full)
+    for (int q = 0; q < 2; ++q) {
+        const uint4 wv = wp[q];
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+            const uint v = wv[j];
+            const half2 p04 = as_type<half2>(((v << 6) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p15 = as_type<half2>(((v << 2) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p26 = as_type<half2>(((v >> 2) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 p37 = as_type<half2>(((v >> 6) & 0x03C003C0u) | 0x3C003C00u);
+            const half2 w0 = half2(p04.x, p15.x);
+            const half2 w1 = half2(p26.x, p37.x);
+            const half2 w2 = half2(p04.y, p15.y);
+            const half2 w3 = half2(p26.y, p37.y);
+            const int o = q * 16 + j * 4;
+            a0 = fma(w0, x2_0[o + 0], a0);
+            b0 = fma(w1, x2_0[o + 1], b0);
+            a0 = fma(w2, x2_0[o + 2], a0);
+            b0 = fma(w3, x2_0[o + 3], b0);
+            a1 = fma(w0, x2_1[o + 0], a1);
+            b1 = fma(w1, x2_1[o + 1], b1);
+            a1 = fma(w2, x2_1[o + 2], a1);
+            b1 = fma(w3, x2_1[o + 3], b1);
+        }
+    }
+    const half2 s2_0 = a0 + b0;
+    const half2 s2_1 = a1 + b1;
+    const float acc0 = float(s2_0.x) + float(s2_0.y);
+    const float acc1 = float(s2_1.x) + float(s2_1.y);
+    return float2((16.f * sb.x) * (acc0 - X0) + sb.y * X0,
+                  (16.f * sb.x) * (acc1 - X1) + sb.y * X1);
+#endif
+}
+
 // Butterfly reduction of 4 row partials across 32 lanes: row r (0..3) ends up in lanes 8r..8r+7.
 static inline float reduce4(thread float* v, ushort lane) {
     float t2[2];
@@ -593,17 +662,69 @@ kernel void k_attn_in(device const wtype* W [[buffer(0)]],
                       ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (st->done) return;
     const int head = tgp.x; // 0..31
-    const int t = tgp.y;
-    if (t >= st->n) return;
-    threadgroup float hv[128];
+    const uint r0 = head * HD + sg * 32;
+    threadgroup float hv[2][128];
     threadgroup float red_h[4];
 
+    if (st->n == 2) {
+        half4 xh0[16], xh1[16];
+        float X0, X1;
+        chunk64_norm(x, wnorm, lane, xh0, X0);
+        chunk64_norm(x + H, wnorm, lane, xh1, X1);
+        for (int rb = 0; rb < 32; rb += 8) {
+            float v0[8], v1[8];
+            for (int b = 0; b < 8; ++b) {
+                const float2 d = dot64_row2(W, SB, r0 + rb + b, lane, H, xh0, X0, xh1, X1);
+                v0[b] = d.x;
+                v1[b] = d.y;
+            }
+            const float y0 = reduce8(v0, lane);
+            const float y1 = reduce8(v1, lane);
+            if ((lane & 3) == 0) {
+                const uint idx = sg * 32 + rb + (lane >> 2);
+                hv[0][idx] = y0;
+                hv[1][idx] = y1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int t = 0; t < 2; ++t) {
+            const int pos = st->pos + t;
+            if (head < 24) {
+                const float val = hv[t][tid];
+                float ss = simd_sum(val * val);
+                if (lane == 0) red_h[sg] = ss;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float hscale = rsqrt((red_h[0] + red_h[1] + red_h[2] + red_h[3]) / float(HD) + EPS);
+                device const float* nw = (head < 16) ? qnorm : knorm;
+                hv[t][tid] = val * hscale * nw[tid];
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < 64) {
+                    const float2 cs = rope[pos * 64 + tid];
+                    const float a = hv[t][tid], b = hv[t][tid + 64];
+                    const float a2 = a * cs.x - b * cs.y;
+                    const float b2 = b * cs.x + a * cs.y;
+                    if (head < 16) {
+                        q[(ulong)t * H + head * HD + tid] = a2;
+                        q[(ulong)t * H + head * HD + tid + 64] = b2;
+                    } else {
+                        device half* k = kc + ((ulong)(head - 16) * st->maxctx + pos) * HD;
+                        k[tid] = half(a2);
+                        k[tid + 64] = half(b2);
+                    }
+                }
+            } else {
+                device half* v_dst = vc + ((ulong)(head - 24) * st->maxctx + pos) * HD;
+                v_dst[tid] = half(hv[t][tid]);
+            }
+        }
+        return;
+    }
+
+    const int t = tgp.y;
+    if (t >= st->n) return;
     half4 xh[16];
     float X;
     chunk64_norm(x + (ulong)t * H, wnorm, lane, xh, X);
-
-    // Each of the 4 simdgroups computes 32 rows of this 128-row head in 4 batches of 8 rows.
-    const uint r0 = head * HD + sg * 32;
     for (int rb = 0; rb < 32; rb += 8) {
         float v[8];
         for (int b = 0; b < 8; ++b) {
@@ -611,27 +732,24 @@ kernel void k_attn_in(device const wtype* W [[buffer(0)]],
         }
         const float y = reduce8(v, lane);
         if ((lane & 3) == 0) {
-            hv[sg * 32 + rb + (lane >> 2)] = y;
+            hv[0][sg * 32 + rb + (lane >> 2)] = y;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int pos = st->pos + t;
     if (head < 24) {
-        // Per-head RMSNorm(128, eps=1e-6) on Q (head 0..15) or K (head 16..23)
-        const float val = hv[tid];
+        const float val = hv[0][tid];
         float ss = simd_sum(val * val);
         if (lane == 0) red_h[sg] = ss;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const float hscale = rsqrt((red_h[0] + red_h[1] + red_h[2] + red_h[3]) / float(HD) + EPS);
         device const float* nw = (head < 16) ? qnorm : knorm;
-        hv[tid] = val * hscale * nw[tid];
+        hv[0][tid] = val * hscale * nw[tid];
         threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Apply 3D M-RoPE (64 frequency pairs over 128 head dims, rotate_half d and d+64)
         if (tid < 64) {
             const float2 cs = rope[pos * 64 + tid];
-            const float a = hv[tid], b = hv[tid + 64];
+            const float a = hv[0][tid], b = hv[0][tid + 64];
             const float a2 = a * cs.x - b * cs.y;
             const float b2 = b * cs.x + a * cs.y;
             if (head < 16) {
@@ -645,7 +763,7 @@ kernel void k_attn_in(device const wtype* W [[buffer(0)]],
         }
     } else {
         device half* v_dst = vc + ((ulong)(head - 24) * st->maxctx + pos) * HD;
-        v_dst[tid] = half(hv[tid]);
+        v_dst[tid] = half(hv[0][tid]);
     }
 }
 
@@ -1116,12 +1234,32 @@ kernel void k_o_proj(device const wtype* W [[buffer(0)]],
                      ushort lane [[thread_index_in_simdgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (st->done) return;
+    const uint r0 = (tgp.x * 2 + sg) * 8;
+    if (st->n == 2 && toff == 0) {
+        half4 xh0[16], xh1[16];
+        float X0, X1;
+        chunk64_plain(a, lane, xh0, X0);
+        chunk64_plain(a + H, lane, xh1, X1);
+        float v0[8], v1[8];
+        for (int b = 0; b < 8; ++b) {
+            const float2 d = dot64_row2(W, SB, r0 + b, lane, H, xh0, X0, xh1, X1);
+            v0[b] = d.x;
+            v1[b] = d.y;
+        }
+        const float y0 = reduce8(v0, lane);
+        const float y1 = reduce8(v1, lane);
+        if ((lane & 3) == 0) {
+            const uint r = r0 + (lane >> 2);
+            x[r] += y0;
+            x[H + r] += y1;
+        }
+        return;
+    }
     const int t = tgp.y + toff;
     if (t >= st->n) return;
     half4 xh[16];
     float X;
     chunk64_plain(a + (ulong)t * H, lane, xh, X);
-    const uint r0 = (tgp.x * 2 + sg) * 8;
     float v[8];
     for (int b = 0; b < 8; ++b) {
         v[b] = dot64_row(W, SB, r0 + b, lane, H, xh, X);
@@ -1146,12 +1284,35 @@ kernel void k_mlp_in(device const wtype* W [[buffer(0)]],
                      ushort lane [[thread_index_in_simdgroup]],
                      ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (st->done) return;
+    const uint u0 = (tgp.x * 2 + sg) * 4;
+    if (st->n == 2 && toff == 0) {
+        half4 xh0[16], xh1[16];
+        float X0, X1;
+        chunk64_norm(x, wnorm, lane, xh0, X0);
+        chunk64_norm(x + H, wnorm, lane, xh1, X1);
+        float v0[8], v1[8];
+        for (int b = 0; b < 4; ++b) {
+            const float2 dg = dot64_row2(W, SB, u0 + b, lane, H, xh0, X0, xh1, X1);
+            const float2 du = dot64_row2(W, SB, FF + u0 + b, lane, H, xh0, X0, xh1, X1);
+            v0[b] = dg.x; v0[4 + b] = du.x;
+            v1[b] = dg.y; v1[4 + b] = du.y;
+        }
+        const float y0 = reduce8(v0, lane);
+        const float up0 = simd_shuffle_down(y0, 16);
+        const float y1 = reduce8(v1, lane);
+        const float up1 = simd_shuffle_down(y1, 16);
+        if ((lane & 3) == 0 && lane < 16) {
+            const uint unit = u0 + (lane >> 2);
+            hbuf[unit] = (y0 / (1.f + exp(-y0))) * up0;
+            hbuf[FF + unit] = (y1 / (1.f + exp(-y1))) * up1;
+        }
+        return;
+    }
     const int t = tgp.y + toff;
     if (t >= st->n) return;
     half4 xh[16];
     float X;
     chunk64_norm(x + (ulong)t * H, wnorm, lane, xh, X);
-    const uint u0 = (tgp.x * 2 + sg) * 4;
     float v[8];
     for (int b = 0; b < 4; ++b) {
         v[b] = dot64_row(W, SB, u0 + b, lane, H, xh, X);
@@ -1177,9 +1338,33 @@ kernel void k_mlp_out(device const wtype* W [[buffer(0)]],
                       ushort lane [[thread_index_in_simdgroup]],
                       ushort sg [[simdgroup_index_in_threadgroup]]) {
     if (st->done) return;
+    const uint r0 = (tgp.x * 2 + sg) * 8;
+    if (st->n == 2 && toff == 0) {
+        float acc0[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        float acc1[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int chunk = 0; chunk < 3; ++chunk) {
+            half4 xh0[16], xh1[16];
+            float X0, X1;
+            const uint c64 = chunk * 32 + lane;
+            chunk64_plain(hbuf + chunk * 2048, lane, xh0, X0);
+            chunk64_plain(hbuf + FF + chunk * 2048, lane, xh1, X1);
+            for (int b = 0; b < 8; ++b) {
+                const float2 d = dot64_row2(W, SB, r0 + b, c64, FF, xh0, X0, xh1, X1);
+                acc0[b] += d.x;
+                acc1[b] += d.y;
+            }
+        }
+        const float y0 = reduce8(acc0, lane);
+        const float y1 = reduce8(acc1, lane);
+        if ((lane & 3) == 0) {
+            const uint r = r0 + (lane >> 2);
+            x[r] += y0;
+            x[H + r] += y1;
+        }
+        return;
+    }
     const int t = tgp.y + toff;
     if (t >= st->n) return;
-    const uint r0 = (tgp.x * 2 + sg) * 8;
     float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
     for (int chunk = 0; chunk < 3; ++chunk) {
         half4 xh[16];
@@ -1243,8 +1428,9 @@ kernel void k_lm_head(device const wtype* E [[buffer(0)]],
     }
 }
 
-// Greedy commit + embed: reduces the 4748 lm_head partial maxima to the next token,
-// appends it to out_tokens, updates M-RoPE position for the next decode step, and embeds it into x[0..H-1].
+// Greedy commit + grammar-guided multi-token embed: reduces the 4748 lm_head partial maxima to the next token,
+// appends deterministic syntax pairs ('click' -> '(', ',' -> ' ') for single-weight-read 2-token decode,
+// stops immediately on ')' (token 8) or EOS, and embeds into x[0..st->n*H-1].
 // Grid (1), 1024 threads.
 kernel void k_commit(device const float* pval [[buffer(0)]],
                      device const int* pidx [[buffer(1)]],
@@ -1271,7 +1457,8 @@ kernel void k_commit(device const float* pval [[buffer(0)]],
     }
     threadgroup float rv[32];
     threadgroup int ri[32];
-    threadgroup int tok_s;
+    threadgroup int tok0_s;
+    threadgroup int tok1_s;
     if (lane == 0) { rv[sg] = best; ri[sg] = bi; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
@@ -1283,20 +1470,38 @@ kernel void k_commit(device const float* pval [[buffer(0)]],
         }
         if (lane == 0) {
             const int tok = bi;
+            st->pos += st->n;
+            st->vis_offset = -1;
             out_tokens[st->step] = tok;
             st->step += 1;
-            st->pos += st->n;
-            st->n = 1;
-            st->vis_offset = -1;
-            const bool stop = tok == st->eos0 || tok == st->eos1 || st->step >= st->maxsteps;
-            if (stop) st->done = 1;
-            tok_s = stop ? -1 : tok;
+            const bool stop = tok == st->eos0 || tok == st->eos1 || tok == 8 || st->step >= st->maxsteps;
+            if (stop) {
+                st->done = 1;
+                st->n = 1;
+                tok0_s = -1;
+                tok1_s = -1;
+            } else if ((st->step == 1 && (tok == 3678 || tok == 7241 || tok == 12476 || tok == 10855 || tok == 11862 || tok == 1339 || tok == 1472 || tok == 24769)) || tok == 11) {
+                const int next_syntax = (tok == 11) ? 220 : 7;
+                out_tokens[st->step] = next_syntax;
+                st->step += 1;
+                st->n = 2;
+                tok0_s = tok;
+                tok1_s = next_syntax;
+            } else {
+                st->n = 1;
+                tok0_s = tok;
+                tok1_s = -1;
+            }
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int tok = tok_s;
-    if (tok < 0) return;
-    for (uint i = tid; i < H; i += 1024) x[i] = embed_at(E, ESB, tok, i);
+    const int t0 = tok0_s;
+    if (t0 < 0) return;
+    for (uint i = tid; i < H; i += 1024) x[i] = embed_at(E, ESB, t0, i);
+    const int t1 = tok1_s;
+    if (t1 >= 0) {
+        for (uint i = tid; i < H; i += 1024) x[H + i] = embed_at(E, ESB, t1, i);
+    }
 }
 
 kernel void k_noop(device int* sink [[buffer(0)]], uint i [[thread_position_in_grid]]) {

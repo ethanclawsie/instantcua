@@ -548,7 +548,7 @@ public final class Engine {
             e.setBuffer(state, offset: 0, index: 4)
             e.setBytes(&toff, length: 4, index: 5)
             e.setBuffer(attnh, offset: 0, index: 6)
-            grid(e, Dims.heads, activeRows, 256)
+            grid(e, Dims.heads, isLastPrefill ? 1 : 2, 256)
         }
 
         if activeRows > 1 {
@@ -586,7 +586,7 @@ public final class Engine {
             e.setBuffer(state, offset: 0, index: 4)
             grid(e, Dims.hidden / 128, nTiles, 128)
         } else {
-            // 3. Output projection + residual (1-token decode or last-layer final token)
+            // 3. Output projection + residual (1- or 2-token decode, or last-layer final token)
             e.setComputePipelineState(pOProj)
             w(e, L(TensorID.wo), 0)
             w(e, L(TensorID.woSB), 1)
@@ -767,10 +767,11 @@ public final class Engine {
         ePre.endEncoding()
         cbPre.commit()
 
-        // 3. Pipeline decode steps on GPU
-        let batchSize = 4
+        // 3. Pipeline decode steps on GPU (8-step batch covers an entire GUI action in 1 command buffer)
+        let batchSize = 8
         var submittedSteps = 1 // prefill commits step 1
         var decodeCBs: [MTLCommandBuffer] = []
+        var waitedPre = false
         while submittedSteps < maxNewTokens {
             let count = min(batchSize, maxNewTokens - submittedSteps)
             let (cbDec, eDec) = newEncoder()
@@ -781,12 +782,18 @@ public final class Engine {
             cbDec.commit()
             decodeCBs.append(cbDec)
             submittedSteps += count
+            if !waitedPre {
+                cbVisOpt?.waitUntilCompleted()
+                cbPre.waitUntilCompleted()
+                waitedPre = true
+            }
+            cbDec.waitUntilCompleted()
             if s[3] != 0 { break }
         }
-
-        cbVisOpt?.waitUntilCompleted()
-        cbPre.waitUntilCompleted()
-        for cb in decodeCBs { cb.waitUntilCompleted() }
+        if !waitedPre {
+            cbVisOpt?.waitUntilCompleted()
+            cbPre.waitUntilCompleted()
+        }
 
         let tEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         let visMs = cbVisOpt.map { ($0.gpuEndTime - $0.gpuStartTime) * 1e3 } ?? 0.0
