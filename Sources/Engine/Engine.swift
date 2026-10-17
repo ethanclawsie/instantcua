@@ -488,7 +488,7 @@ public final class Engine {
             w(e, L(TensorID.wqkvSB), 2)
             e.setBuffer(qkvBuf, offset: 0, index: 3)
             e.setBuffer(state, offset: 0, index: 4)
-            grid(e, Dims.qkvRows / 32, nTiles, 128)
+            grid(e, Dims.qkvRows / 128, nTiles, 128)
 
             e.setComputePipelineState(pQkNormRope)
             e.setBuffer(qkvBuf, offset: 0, index: 0)
@@ -554,7 +554,7 @@ public final class Engine {
             w(e, L(TensorID.woSB), 2)
             e.setBuffer(x, offset: 0, index: 3)
             e.setBuffer(state, offset: 0, index: 4)
-            grid(e, Dims.hidden / 32, nTiles, 128)
+            grid(e, Dims.hidden / 128, nTiles, 128)
 
             // 4. MLP RMSNorm + gate/up + SwiGLU on Neural Accelerators
             e.setComputePipelineState(pRmsNormRowsH)
@@ -570,7 +570,7 @@ public final class Engine {
             w(e, L(TensorID.wguSB), 2)
             e.setBuffer(hbufh, offset: 0, index: 3)
             e.setBuffer(state, offset: 0, index: 4)
-            grid(e, Dims.ff / 32, nTiles, 128)
+            grid(e, Dims.ff / 64, nTiles, 128)
 
             // 5. MLP down + residual on Neural Accelerators
             e.setComputePipelineState(pG3Down)
@@ -579,7 +579,7 @@ public final class Engine {
             w(e, L(TensorID.wdSB), 2)
             e.setBuffer(x, offset: 0, index: 3)
             e.setBuffer(state, offset: 0, index: 4)
-            grid(e, Dims.hidden / 32, nTiles, 128)
+            grid(e, Dims.hidden / 128, nTiles, 128)
         } else {
             // 3. Output projection + residual (1-token decode or last-layer final token)
             e.setComputePipelineState(pOProj)

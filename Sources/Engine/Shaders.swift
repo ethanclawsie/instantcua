@@ -730,12 +730,13 @@ kernel void k_qk_norm_rope(device const float* qkv [[buffer(0)]],
     }
 }
 
-// M5 Neural Accelerator (matmul2d) tile helper for LLM prefill GEMMs (f16, q8, q4).
-template<int K, int TT, int NS, int BK>
+// M5 Neural Accelerator (matmul2d) data-parallel tile helper for LLM prefill GEMMs (f16, q8, q4).
+// Each simdgroup independently computes a [TT, 32] output tile at row offset r0 while sharing X in L1 cache.
+template<int K, int TT, int BK>
 inline void llm_gemm_tile(device half* X, device const wtype* W, device const half2* SB,
                           uint r0, int t0, threadgroup half* Wsg, threadgroup float* Os,
                           uint lane, uint sg) {
-    constexpr int NSTEP = K / BK / NS;
+    constexpr int NSTEP = K / BK;
     auto tX = tensor(X + (ulong)t0 * K, dextents<int, 2>(K, TT), array<int, 2>({1, K}));
     threadgroup half* ws = Wsg + sg * 32 * BK;
     auto tW = tensor(ws, dextents<int, 2>(BK, 32), array<int, 2>({1, BK}));
@@ -749,7 +750,7 @@ inline void llm_gemm_tile(device half* X, device const wtype* W, device const ha
 #if FMT == 0
     auto tWd = tensor((device half*)(W + (ulong)r0 * K), dextents<int, 2>(K, 32), array<int, 2>({1, K}));
     for (int i = 0; i < NSTEP; ++i) {
-        const uint k0 = (sg * NSTEP + i) * BK;
+        const uint k0 = i * BK;
         auto a = tX.template slice<BK, TT>(k0, 0);
         auto b = tWd.template slice<BK, 32>(k0, 0);
         op.run(a, b, cT);
@@ -759,7 +760,7 @@ inline void llm_gemm_tile(device half* X, device const wtype* W, device const ha
     device const half* srow = (device const half*)SB + (ulong)(r0 + lane) * (K / 32);
     threadgroup half4* dst = (threadgroup half4*)(ws + lane * BK);
     for (int i = 0; i < NSTEP; ++i) {
-        const uint k0 = (sg * NSTEP + i) * BK;
+        const uint k0 = i * BK;
         for (int q = 0; q < BK / 32; ++q) {
             const half s = srow[k0 / 32 + q];
             device const uint4* src = (device const uint4*)(wrow + k0 + q * 32);
@@ -779,7 +780,7 @@ inline void llm_gemm_tile(device half* X, device const wtype* W, device const ha
     device const half2* sbrow = SB + (ulong)(r0 + lane) * (K / 64);
     threadgroup half2* dst = (threadgroup half2*)(ws + lane * BK);
     for (int i = 0; i < NSTEP; ++i) {
-        const uint k0 = (sg * NSTEP + i) * BK;
+        const uint k0 = i * BK;
         const half2 sb = sbrow[k0 / 64];
         const half2 mul = half2(half(16.f * float(sb.x)));
         const half2 add = half2(half(float(sb.y) - 16.f * float(sb.x)));
@@ -805,120 +806,101 @@ inline void llm_gemm_tile(device half* X, device const wtype* W, device const ha
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 #endif
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
     auto tO = tensor(Os + sg * TT * 32, dextents<int, 2>(32, TT), array<int, 2>({1, 32}));
     cT.store(tO);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Prefill QKV GEMM on M5 Neural Accelerators: Grid (QKV_DIM / 32, (n + 31) / 32) = (128, (n + 31) / 32), 128 threads.
+// Prefill QKV GEMM on M5 Neural Accelerators: Grid (QKV_DIM / 128, (n + 31) / 32) = (32, (n + 31) / 32), 128 threads.
 kernel void k_g3_qkv(device half* X [[buffer(0)]],
                      device const wtype* W [[buffer(1)]],
                      device const half2* SB [[buffer(2)]],
                      device float* outf [[buffer(3)]],
                      device const State* st [[buffer(4)]],
                      uint2 tgp [[threadgroup_position_in_grid]],
-                     uint tid [[thread_index_in_threadgroup]],
                      uint lane [[thread_index_in_simdgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr int TT = 32, NS = 4, BK = 64, NT = NS * 32;
+    constexpr int TT = 32, BK = 64;
     if (st->done || (int)(tgp.y * TT) >= st->n) return;
     threadgroup float smem[4096]; // 16 KiB shared by Wsg and Os
-    const uint r0 = tgp.x * 32;
+    const uint r0 = tgp.x * 128 + sg * 32;
     const int t0 = tgp.y * TT, n = st->n;
-    llm_gemm_tile<H, TT, NS, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
-    for (int w = tid; w < TT * 32; w += NT) {
-        const int t = w / 32, r = w % 32;
-        if (t0 + t >= n) continue;
-        float v = 0.f;
-        for (int q = 0; q < NS; ++q) v += smem[q * TT * 32 + w];
-        outf[(ulong)(t0 + t) * QKV_DIM + r0 + r] = v;
+    llm_gemm_tile<H, TT, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
+    threadgroup const float* os = smem + sg * TT * 32;
+    for (int t = 0; t < TT; ++t) {
+        if (t0 + t < n) outf[(ulong)(t0 + t) * QKV_DIM + r0 + lane] = os[t * 32 + lane];
     }
 }
 
-// Prefill Output Projection + residual GEMM on M5 Neural Accelerators: Grid (H / 32, (n + 31) / 32), 128 threads.
+// Prefill Output Projection + residual GEMM on M5 Neural Accelerators: Grid (H / 128, (n + 31) / 32) = (16, (n + 31) / 32), 128 threads.
 kernel void k_g3_o(device half* X [[buffer(0)]],
                    device const wtype* W [[buffer(1)]],
                    device const half2* SB [[buffer(2)]],
                    device float* outf [[buffer(3)]],
                    device const State* st [[buffer(4)]],
                    uint2 tgp [[threadgroup_position_in_grid]],
-                   uint tid [[thread_index_in_threadgroup]],
                    uint lane [[thread_index_in_simdgroup]],
                    uint sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr int TT = 32, NS = 4, BK = 64, NT = NS * 32;
+    constexpr int TT = 32, BK = 64;
     if (st->done || (int)(tgp.y * TT) >= st->n) return;
     threadgroup float smem[4096];
-    const uint r0 = tgp.x * 32;
+    const uint r0 = tgp.x * 128 + sg * 32;
     const int t0 = tgp.y * TT, n = st->n;
-    llm_gemm_tile<H, TT, NS, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
-    for (int w = tid; w < TT * 32; w += NT) {
-        const int t = w / 32, r = w % 32;
-        if (t0 + t >= n) continue;
-        float v = 0.f;
-        for (int q = 0; q < NS; ++q) v += smem[q * TT * 32 + w];
-        outf[(ulong)(t0 + t) * H + r0 + r] += v;
+    llm_gemm_tile<H, TT, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
+    threadgroup const float* os = smem + sg * TT * 32;
+    for (int t = 0; t < TT; ++t) {
+        if (t0 + t < n) outf[(ulong)(t0 + t) * H + r0 + lane] += os[t * 32 + lane];
     }
 }
 
-// Prefill Gate + Up + SwiGLU GEMM on M5 Neural Accelerators: Grid (FF / 32, (n + 31) / 32) = (192, (n + 31) / 32), 128 threads.
+// Prefill Gate + Up + SwiGLU GEMM on M5 Neural Accelerators: Grid (FF / 64, (n + 31) / 32) = (96, (n + 31) / 32), 128 threads.
+// Simdgroups 0..1 compute 64 gate rows and simdgroups 2..3 compute 64 up rows simultaneously in a single K-loop.
 kernel void k_g3_gu(device half* X [[buffer(0)]],
                     device const wtype* W [[buffer(1)]],
                     device const half2* SB [[buffer(2)]],
                     device half* outh [[buffer(3)]],
                     device const State* st [[buffer(4)]],
                     uint2 tgp [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]],
                     uint lane [[thread_index_in_simdgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr int TT = 32, NS = 4, BK = 64, NT = NS * 32;
+    constexpr int TT = 32, BK = 64;
     if (st->done || (int)(tgp.y * TT) >= st->n) return;
     threadgroup float smem[4096];
-    const uint r0 = tgp.x * 32;
+    const uint u0 = tgp.x * 64;
+    const uint r0 = (sg < 2) ? (u0 + sg * 32) : (FF + u0 + (sg - 2) * 32);
     const int t0 = tgp.y * TT, n = st->n;
-    llm_gemm_tile<H, TT, NS, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
-    float g_reg[8];
-    for (int m = 0; m < 8; ++m) {
-        const int w = tid + m * NT;
-        float v = 0.f;
-        for (int q = 0; q < NS; ++q) v += smem[q * TT * 32 + w];
-        g_reg[m] = v;
-    }
+    llm_gemm_tile<H, TT, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    llm_gemm_tile<H, TT, NS, BK>(X, W, SB, FF + r0, t0, (threadgroup half*)smem, smem, lane, sg);
-    for (int m = 0; m < 8; ++m) {
-        const int w = tid + m * NT;
-        const int t = w / 32, r = w % 32;
+    const uint h = sg & 1;
+    const int t_start = int(sg >> 1) * (TT / 2);
+    for (int dt = 0; dt < TT / 2; ++dt) {
+        const int t = t_start + dt;
         if (t0 + t >= n) continue;
-        float u = 0.f;
-        for (int q = 0; q < NS; ++q) u += smem[q * TT * 32 + w];
-        const float g = g_reg[m];
-        outh[(ulong)(t0 + t) * FF + r0 + r] = half((g / (1.f + exp(-g))) * u);
+        const float g = smem[h * 1024 + t * 32 + lane];
+        const float u = smem[(h + 2) * 1024 + t * 32 + lane];
+        outh[(ulong)(t0 + t) * FF + u0 + h * 32 + lane] = half((g / (1.f + exp(-g))) * u);
     }
 }
 
-// Prefill Down Projection + residual GEMM on M5 Neural Accelerators: Grid (H / 32, (n + 31) / 32), 128 threads.
+// Prefill Down Projection + residual GEMM on M5 Neural Accelerators: Grid (H / 128, (n + 31) / 32) = (16, (n + 31) / 32), 128 threads.
 kernel void k_g3_down(device half* X [[buffer(0)]],
                       device const wtype* W [[buffer(1)]],
                       device const half2* SB [[buffer(2)]],
                       device float* outf [[buffer(3)]],
                       device const State* st [[buffer(4)]],
                       uint2 tgp [[threadgroup_position_in_grid]],
-                      uint tid [[thread_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]]) {
-    constexpr int TT = 32, NS = 4, BK = 64, NT = NS * 32;
+    constexpr int TT = 32, BK = 64;
     if (st->done || (int)(tgp.y * TT) >= st->n) return;
     threadgroup float smem[4096];
-    const uint r0 = tgp.x * 32;
+    const uint r0 = tgp.x * 128 + sg * 32;
     const int t0 = tgp.y * TT, n = st->n;
-    llm_gemm_tile<FF, TT, NS, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
-    for (int w = tid; w < TT * 32; w += NT) {
-        const int t = w / 32, r = w % 32;
-        if (t0 + t >= n) continue;
-        float v = 0.f;
-        for (int q = 0; q < NS; ++q) v += smem[q * TT * 32 + w];
-        outf[(ulong)(t0 + t) * H + r0 + r] += v;
+    llm_gemm_tile<FF, TT, BK>(X, W, SB, r0, t0, (threadgroup half*)smem, smem, lane, sg);
+    threadgroup const float* os = smem + sg * TT * 32;
+    for (int t = 0; t < TT; ++t) {
+        if (t0 + t < n) outf[(ulong)(t0 + t) * H + r0 + lane] += os[t * 32 + lane];
     }
 }
 
